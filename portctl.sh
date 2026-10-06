@@ -110,34 +110,54 @@ show_limit_menu() {
     printf '%s当前配置:%s %s:%s-%s  %s/端口  (%s)\n' \
         "$DIM" "$RESET" "$NIC" "$PORT_START" "$PORT_END" "$SPEED" \
         "$(current_rate_mb "$SPEED")"
-    printf '\n%sA%s 立即应用当前配置\n' "$GREEN" "$RESET"
-    printf '%sS%s 临时设置每端口速率\n' "$GREEN" "$RESET"
-    printf '%sR%s 查看 tc 规则统计\n' "$GREEN" "$RESET"
-    printf '%sB%s 返回主菜单\n' "$GREEN" "$RESET"
+    printf '\n%s1.%s 立即应用当前配置\n' "$GREEN" "$RESET"
+    printf '%s2.%s 修改每端口限速\n' "$GREEN" "$RESET"
+    printf '%s3.%s 查看 tc 规则统计\n' "$GREEN" "$RESET"
+    printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
     printf '\n%s选择:%s ' "$CYAN" "$RESET"
     read -r choice
 
-    case "${choice,,}" in
-        a)
+    case "$choice" in
+        1)
             run_root "$LIMIT_SCRIPT" apply || true
             pause_screen
             ;;
-        s)
-            printf '输入速率（例如 8mbit、12mbit、20mbit）: '
-            read -r new_speed
-            if [[ -n "$new_speed" ]]; then
-                run_root "$LIMIT_SCRIPT" apply --speed "$new_speed" || true
-                SPEED="$new_speed"
+        2)
+            printf '输入限速数值（只输入数字，例如 8、12、20）: '
+            read -r rate_value
+            if [[ "$rate_value" =~ ^([0-9]+([.][0-9]+)?)$ ]] &&
+                awk "BEGIN { exit !($rate_value > 0) }"; then
+                printf '\n%s请选择计量单位:%s\n' "$CYAN" "$RESET"
+                printf '%s1.%s Mbit/s（兆比特/秒）\n' "$GREEN" "$RESET"
+                printf '%s2.%s MB/s（兆字节/秒）\n' "$GREEN" "$RESET"
+                printf '%s3.%s Gbit/s（千兆比特/秒）\n' "$GREEN" "$RESET"
+                printf '%s4.%s GB/s（千兆字节/秒）\n' "$GREEN" "$RESET"
+                printf '%s选择单位:%s ' "$CYAN" "$RESET"
+                read -r unit_choice
+                new_speed=""
+                case "$unit_choice" in
+                    1) new_speed="${rate_value}mbit" ;;
+                    2) new_speed="$(awk "BEGIN { printf \"%.6gmbit\", $rate_value * 8 }")" ;;
+                    3) new_speed="${rate_value}gbit" ;;
+                    4) new_speed="$(awk "BEGIN { printf \"%.6ggbit\", $rate_value * 8 }")" ;;
+                    *) printf '%s单位选择无效。%s\n' "$RED" "$RESET" ;;
+                esac
+                if [[ -n "$new_speed" ]]; then
+                    run_root "$LIMIT_SCRIPT" apply --speed "$new_speed" || true
+                    SPEED="$new_speed"
+                fi
+            else
+                printf '%s请输入大于 0 的数字。%s\n' "$RED" "$RESET"
             fi
             pause_screen
             ;;
-        r)
+        3)
             run_root tc -s qdisc show dev "$NIC" || true
             run_root tc -s class show dev "$NIC" || true
             pause_screen
             ;;
-        b|"") ;;
-        *) printf '%s未知选项%s\n' "$RED" "$RESET"; pause_screen ;;
+        0|"") ;;
+        *) printf '%s请输入 1、2、3 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
     esac
 }
 
