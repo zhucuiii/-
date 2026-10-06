@@ -21,6 +21,14 @@ sudo systemctl enable --now limit-ports.service
 bash <(wget -qO- https://raw.githubusercontent.com/zhucuiii/-/main/install.sh)
 ```
 
+或者：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/zhucuiii/-/main/install.sh)
+```
+
+上面两条命令功能相同，选择其中一条执行即可。
+
 安装后运行 SSH 菜单：
 
 ```bash
