@@ -8,6 +8,7 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-/etc/default/limit-ports}"
 LIMIT_SCRIPT="${LIMIT_SCRIPT:-/usr/local/sbin/limit_ports.sh}"
+INSTALL_URL="${INSTALL_URL:-https://raw.githubusercontent.com/zhucuiii/-/main/install.sh}"
 [[ -x "$LIMIT_SCRIPT" ]] || LIMIT_SCRIPT="$ROOT_DIR/limit_ports.sh"
 
 if [[ -r "$CONFIG_FILE" ]]; then
@@ -89,13 +90,14 @@ draw_menu() {
     printf '%s03.%s  %s服务管理%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s04.%s  %s防火墙规则%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s05.%s  %s日志中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s06.%s  %s脚本更新%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s07.%s  %s网络诊断%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s08.%s  %s进程查看%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s09.%s  %s连接统计%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s10.%s  %s系统资源%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s11.%s  %s配置中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s12.%s  %s扩展模块%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s06.%s  %s更新脚本%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s07.%s  %s卸载程序%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s08.%s  %s网络诊断%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s09.%s  %s进程查看%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s10.%s  %s连接统计%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s11.%s  %s系统资源%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s12.%s  %s配置中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s13.%s  %s扩展模块%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s----------------------------------------%s\n' "$BLUE" "$RESET"
     printf '%s00.%s  %s刷新状态%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s0.%s   %s退出控制台%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
@@ -193,16 +195,71 @@ show_logs() {
     pause_screen
 }
 
+download_file() {
+    local url="$1"
+    local target="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 "$url" -o "$target"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$target" "$url"
+    else
+        printf '%s需要 curl 或 wget 才能联网。%s\n' "$RED" "$RESET"
+        return 1
+    fi
+    [[ -s "$target" ]]
+}
+
 update_script() {
     clear_screen
     draw_brand
-    printf '\n%s[06] 脚本更新%s\n\n' "$YELLOW" "$RESET"
-    if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        git -C "$ROOT_DIR" pull --ff-only
+    printf '\n%s[06] 更新脚本%s\n\n' "$YELLOW" "$RESET"
+    printf '%s正在从 GitHub 获取最新版本...%s\n' "$DIM" "$RESET"
+    local tmp_dir installer
+    tmp_dir="$(mktemp -d)"
+    installer="$tmp_dir/install.sh"
+    if download_file "$INSTALL_URL" "$installer"; then
+        chmod 0755 "$installer"
+        run_root bash "$installer" --no-menu
+        printf '\n%s更新完成，现有配置已保留。%s\n' "$GREEN" "$RESET"
     else
-        printf '%s当前脚本不是 Git 工作目录。%s\n' "$RED" "$RESET"
+        printf '%s更新失败，请检查网络或稍后重试。%s\n' "$RED" "$RESET"
     fi
+    rm -rf "$tmp_dir"
     pause_screen
+}
+
+uninstall_program() {
+    clear_screen
+    draw_brand
+    printf '\n%s[07] 卸载程序%s\n\n' "$YELLOW" "$RESET"
+    printf '%s这将停止服务并删除 zc、portctl.sh 和 limit_ports.sh。%s\n' "$RED" "$RESET"
+    printf '%s默认保留 /etc/default/limit-ports 配置。%s\n\n' "$DIM" "$RESET"
+    printf '确认卸载请输入 %sYES%s，其他输入取消: ' "$RED" "$RESET"
+    read -r confirmation
+    [[ "$confirmation" == "YES" ]] || {
+        printf '%s已取消卸载。%s\n' "$DIM" "$RESET"
+        pause_screen
+        return
+    }
+
+    printf '\n是否同时删除配置 /etc/default/limit-ports？[y/N]: '
+    read -r remove_config
+    if command -v systemctl >/dev/null 2>&1; then
+        run_root systemctl disable --now limit-ports.service 2>/dev/null || true
+        run_root rm -f /etc/systemd/system/limit-ports.service
+        run_root systemctl daemon-reload 2>/dev/null || true
+    fi
+    run_root rm -f /usr/local/bin/zc
+    run_root rm -f /usr/local/sbin/portctl.sh
+    run_root rm -f /usr/local/sbin/limit_ports.sh
+    if [[ "${remove_config,,}" == "y" || "${remove_config,,}" == "yes" ]]; then
+        run_root rm -f /etc/default/limit-ports
+    fi
+    printf '%s卸载完成。%s\n' "$GREEN" "$RESET"
+    printf '%s当前菜单进程将在返回后退出。%s\n' "$DIM" "$RESET"
+    pause_screen
+    clear_screen
+    exit 0
 }
 
 show_placeholder() {
@@ -229,12 +286,13 @@ main_menu() {
             4|04) show_placeholder "[04] 防火墙规则" ;;
             5|05) show_logs ;;
             6|06) update_script ;;
-            7|07) show_placeholder "[07] 网络诊断" ;;
-            8|08) show_placeholder "[08] 进程查看" ;;
-            9|09) show_placeholder "[09] 连接统计" ;;
-            10) show_placeholder "[10] 系统资源" ;;
-            11) show_placeholder "[11] 配置中心" ;;
-            12) show_placeholder "[12] 扩展模块" ;;
+            7|07) uninstall_program ;;
+            8|08) show_placeholder "[08] 网络诊断" ;;
+            9|09) show_placeholder "[09] 进程查看" ;;
+            10) show_placeholder "[10] 连接统计" ;;
+            11) show_placeholder "[11] 系统资源" ;;
+            12) show_placeholder "[12] 配置中心" ;;
+            13) show_placeholder "[13] 扩展模块" ;;
             00) continue ;;
             0|q|Q)
                 clear_screen
