@@ -15,6 +15,24 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now limit-ports.service
 ```
 
+也可以像常见的一键脚本一样直接部署：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/zhucuiii/-/main/install.sh)
+```
+
+安装后运行 SSH 菜单：
+
+```bash
+sudo /usr/local/sbin/portctl.sh
+```
+
+如果希望安装后自动启用 systemd：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/zhucuiii/-/main/install.sh) --enable
+```
+
 ## 自定义限速
 
 `12mbit` 约等于 `1.5 MB/s`。可以修改 `/etc/default/limit-ports`：
