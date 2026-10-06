@@ -1,0 +1,9 @@
+# Local/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local deployment copies
+.env
+config/limit-ports

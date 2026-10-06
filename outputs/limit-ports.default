@@ -1,0 +1,9 @@
+# Copy to /etc/default/limit-ports and adjust for your server.
+NIC="eth0"
+SPEED="12mbit"
+# Unmatched traffic uses this class. Set it to the actual link capacity.
+DEFAULT_RATE="1000mbit"
+PORT_START="10001"
+PORT_END="10200"
+CLASS_START="10"
+R2Q="100"

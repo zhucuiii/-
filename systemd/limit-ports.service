@@ -1,0 +1,13 @@
+[Unit]
+Description=Per-port egress bandwidth limiting with tc
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/limit_ports.sh apply
+ExecStop=/usr/local/sbin/limit_ports.sh stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
