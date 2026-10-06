@@ -5,8 +5,8 @@
 ## 快速使用
 
 ```bash
-git clone https://github.com/YOUR_NAME/tc-limit-ports.git
-cd tc-limit-ports
+git clone https://github.com/zhucuiii/-.git
+cd ./-
 
 sudo install -m 0755 limit_ports.sh /usr/local/sbin/limit_ports.sh
 sudo install -m 0644 config/limit-ports.example /etc/default/limit-ports
