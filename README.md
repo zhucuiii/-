@@ -41,6 +41,18 @@ sudo /usr/local/sbin/portctl.sh
 bash <(wget -qO- https://raw.githubusercontent.com/zhucuiii/-/main/install.sh) --enable
 ```
 
+安装脚本默认会在完成后自动打开 SSH 菜单，并创建快捷命令：
+
+```bash
+zc
+```
+
+如果只想安装、不自动打开菜单：
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/zhucuiii/-/main/install.sh) --no-menu
+```
+
 ## 自定义限速
 
 `12mbit` 约等于 `1.5 MB/s`。可以修改 `/etc/default/limit-ports`：
