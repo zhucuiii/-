@@ -42,3 +42,13 @@ sudo /usr/local/sbin/limit_ports.sh stop
 - 脚本会接管网卡的整个 root qdisc，不能与其他 QoS、Docker 或 Kubernetes 流量控制直接叠加。
 - `DEFAULT_RATE` 应设置为服务器实际链路速率，用于承载未匹配的流量。
 
+## 控制台界面
+
+仓库内的 `ui/` 是一个可扩展的终端风格控制台原型。它不依赖第三方前端框架：
+
+```bash
+node ui/server.mjs
+```
+
+然后打开 `http://127.0.0.1:4173`。当前已接入菜单切换、编号输入、方向键导航、状态指标和活动日志，后续可以把“应用规则”按钮接到真实脚本或 API。
+

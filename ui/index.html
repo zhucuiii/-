@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b101c" />
+    <title>PORT//CTL 控制台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="console-shell">
+      <section class="terminal-panel" aria-label="Port control terminal">
+        <header class="brand-block">
+          <div class="brand-mark" aria-label="PORT CONTROL">PORT//CTL</div>
+          <p class="brand-subtitle">服务器端口控制台 <span>v0.1.0</span></p>
+          <p class="brand-hint">输入编号进入模块，方向键可浏览菜单</p>
+        </header>
+
+        <div class="rule" aria-hidden="true"></div>
+
+        <nav class="menu-list" aria-label="功能菜单">
+          <button class="menu-item is-active" data-module="limit">
+            <span class="menu-index">01.</span><span>端口限速</span><span class="menu-state">READY</span>
+          </button>
+          <button class="menu-item" data-module="inspect">
+            <span class="menu-index">02.</span><span>系统信息</span><span class="menu-state">VIEW</span>
+          </button>
+          <button class="menu-item" data-module="service">
+            <span class="menu-index">03.</span><span>服务管理</span><span class="menu-state">OPEN</span>
+          </button>
+          <button class="menu-item" data-module="firewall">
+            <span class="menu-index">04.</span><span>防火墙规则</span><span class="menu-state">OPEN</span>
+          </button>
+          <button class="menu-item" data-module="logs">
+            <span class="menu-index">05.</span><span>日志中心</span><span class="menu-state">VIEW</span>
+          </button>
+          <button class="menu-item" data-module="update">
+            <span class="menu-index">06.</span><span>脚本更新</span><span class="menu-state">SYNC</span>
+          </button>
+        </nav>
+
+        <div class="rule" aria-hidden="true"></div>
+
+        <div class="utility-menu">
+          <button class="utility-item" data-action="refresh">
+            <span class="menu-index">00.</span><span>刷新状态</span>
+          </button>
+          <button class="utility-item" data-action="exit">
+            <span class="menu-index">0.</span><span>退出控制台</span>
+          </button>
+        </div>
+
+        <div class="prompt-line">
+          <span class="prompt-label">选择模块:</span>
+          <input id="commandInput" type="text" inputmode="numeric" maxlength="2" autocomplete="off" aria-label="输入菜单编号" />
+          <span class="cursor" aria-hidden="true"></span>
+        </div>
+        <p id="consoleMessage" class="console-message" role="status">等待输入。按 Enter 打开端口限速。</p>
+      </section>
+
+      <aside class="workspace-panel" aria-live="polite">
+        <div class="workspace-topline">
+          <span class="eyebrow">ACTIVE MODULE</span>
+          <span class="connection-dot"><i></i> LOCAL</span>
+        </div>
+        <div class="module-heading">
+          <span id="moduleCode">01</span>
+          <div>
+            <p class="module-kicker">PORT // CONTROL</p>
+            <h1 id="moduleTitle">端口限速</h1>
+          </div>
+        </div>
+        <p id="moduleDescription" class="module-description">为服务端口创建独立的出口带宽规则。</p>
+
+        <div class="metric-grid">
+          <div class="metric">
+            <span class="metric-label">网卡</span>
+            <strong id="metricNic">eth0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">当前速率</span>
+            <strong id="metricSpeed">12mbit</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">端口范围</span>
+            <strong id="metricPorts">10001—10200</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">规则状态</span>
+            <strong class="accent-green">READY</strong>
+          </div>
+        </div>
+
+        <div class="module-actions" id="moduleActions">
+          <button class="action-button primary" data-action="apply">应用规则 <span>↵</span></button>
+          <button class="action-button" data-action="edit">编辑参数 <span>→</span></button>
+        </div>
+
+        <div class="activity-log">
+          <div class="log-header">
+            <span>ACTIVITY LOG</span>
+            <span id="logClock">--:--:--</span>
+          </div>
+          <div id="logEntries" class="log-entries">
+            <p><time>10:24:08</time><span class="log-ok">OK</span> root qdisc ready</p>
+            <p><time>10:24:09</time><span class="log-ok">OK</span> 200 port classes loaded</p>
+            <p><time>10:24:11</time><span class="log-info">INFO</span> console awaiting input</p>
+          </div>
+        </div>
+      </aside>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
