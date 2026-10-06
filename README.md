@@ -42,13 +42,22 @@ sudo /usr/local/sbin/limit_ports.sh stop
 - 脚本会接管网卡的整个 root qdisc，不能与其他 QoS、Docker 或 Kubernetes 流量控制直接叠加。
 - `DEFAULT_RATE` 应设置为服务器实际链路速率，用于承载未匹配的流量。
 
-## 控制台界面
+## SSH 终端控制台
 
-仓库内的 `ui/` 是一个可扩展的终端风格控制台原型。它不依赖第三方前端框架：
+仓库内的 `portctl.sh` 是纯 Bash 的 SSH 交互菜单，不需要网页、Node 或 Python：
 
 ```bash
-node ui/server.mjs
+chmod +x portctl.sh
+sudo ./portctl.sh
 ```
 
-然后打开 `http://127.0.0.1:4173`。当前已接入菜单切换、编号输入、方向键导航、状态指标和活动日志，后续可以把“应用规则”按钮接到真实脚本或 API。
+菜单支持编号输入，当前已接入：
+
+- `01` 端口限速：应用当前配置、临时修改速率、查看 `tc` 统计
+- `02` 系统信息
+- `03` 服务管理
+- `05` 日志中心
+- `06` 从 GitHub 更新脚本
+
+其余菜单已经预留，后续功能可以直接添加到 `portctl.sh`。
 
