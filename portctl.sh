@@ -157,7 +157,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.6.2%s\n' "$CYAN" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.6.3%s\n' "$CYAN" "$RESET"
     printf '%s输入编号进入模块，0 退出，00 刷新%s\n' "$DIM" "$RESET"
 }
 
@@ -789,6 +789,209 @@ show_port_stats() {
     pause_screen
 }
 
+# ------------------------------------------- all-port live traffic monitor
+#
+# The tc counters only exist for ports we shape. To watch every port we read
+# the kernel connection tracking table instead: it carries per-connection
+# byte counters for both directions and needs no extra packages.
+#
+# Only connections where the ORIGINAL tuple targets one of our own addresses
+# are counted, i.e. the host acting as a server. That also avoids counting
+# the docker-proxy -> container leg twice.
+
+CONNTRACK_FILE="${CONNTRACK_FILE:-/proc/net/nf_conntrack}"
+TRAFFIC_INTERVAL="${TRAFFIC_INTERVAL:-2}"
+TRAFFIC_TOP="${TRAFFIC_TOP:-25}"
+
+local_ip_set() {
+    ip -o addr show scope global 2>/dev/null |
+        awk '{ split($4, a, "/"); print a[1] }' |
+        tr '\n' ' '
+}
+
+conntrack_source() {
+    if [[ -r "$CONNTRACK_FILE" ]]; then
+        printf 'file'
+    elif command -v conntrack >/dev/null 2>&1; then
+        printf 'cmd'
+    else
+        printf 'none'
+    fi
+}
+
+# 输出: proto<TAB>port<TAB>bytes<TAB>connections
+conntrack_by_port() {
+    local ips
+    ips="$(local_ip_set)"
+    local awk_prog='
+        BEGIN {
+            n = split(ips, a, " ")
+            for (i = 1; i <= n; i++) {
+                if (a[i] != "") { local[a[i]] = 1 }
+            }
+        }
+        {
+            c = 0
+            proto = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^(tcp|udp|sctp|icmp|icmpv6)$/ && proto == "") { proto = $i }
+                else if ($i ~ /^src=/)        { c++; src[c]   = substr($i, 5) }
+                else if ($i ~ /^dst=/)        { dst[c]   = substr($i, 5) }
+                else if ($i ~ /^sport=/)      { sport[c] = substr($i, 7) }
+                else if ($i ~ /^dport=/)      { dport[c] = substr($i, 7) }
+                else if ($i ~ /^bytes=/)      { bytes[c] = substr($i, 7) + 0 }
+            }
+            if (c < 1 || proto == "") { next }
+            # 本机作为服务端：原始方向的目的地址是本机
+            if (!(dst[1] in local)) { next }
+            p = dport[1]
+            if (p == "") { next }
+            key = proto "\t" p
+            total[key] += bytes[1] + bytes[2]
+            conns[key]++
+        }
+        END {
+            for (k in total) { printf "%s\t%d\t%d\n", k, total[k], conns[k] }
+        }
+    '
+
+    case "$(conntrack_source)" in
+        file)
+            awk -v ips="$ips" "$awk_prog" "$CONNTRACK_FILE" 2>/dev/null || true
+            ;;
+        cmd)
+            conntrack -L -o extended 2>/dev/null |
+                awk -v ips="$ips" "$awk_prog" 2>/dev/null || true
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# 这个端口有没有被限速（读的是 [01] 里的规则）
+limited_rate_of() {
+    local port="$1" i
+    for ((i = 0; i < ${#RULE_IDX[@]}; i++)); do
+        if (( port >= RULE_START[i] && port <= RULE_END[i] )); then
+            printf '%s' "${RULE_RATE[i]}"
+            return 0
+        fi
+    done
+    printf '—'
+}
+
+draw_traffic_screen() {
+    local prev="$1" cur="$2" interval="$3"
+    local -A prev_bytes=()
+    local proto port bytes conns
+
+    while IFS=$'\t' read -r proto port bytes conns; do
+        if [[ -n "$port" ]]; then
+            prev_bytes["$proto/$port"]="$bytes"
+        fi
+    done <<<"$prev"
+
+    local rows="" active=0 total=0
+    local delta base
+    while IFS=$'\t' read -r proto port bytes conns; do
+        if [[ -z "$port" ]]; then
+            continue
+        fi
+        base="${prev_bytes["$proto/$port"]:-0}"
+        delta=$((bytes - base))
+        if (( delta < 0 )); then
+            delta=0
+        fi
+        # 只显示这段时间里真的有流量经过的端口
+        if (( delta == 0 )); then
+            continue
+        fi
+        active=$((active + 1))
+        total=$((total + delta))
+        rows+="$delta"$'\t'"$port"$'\t'"$proto"$'\t'"$(format_speed "$delta" "$interval")"$'\t'"$conns"$'\t'"$(limited_rate_of "$port")"$'\n'
+    done <<<"$cur"
+
+    # 不整屏清，避免闪烁
+    printf '%s[H' "$ESC"
+    draw_brand
+    printf '\n%s[01-9] 全部端口实时流量%s   %s%s%s   %s每 %s 秒刷新，Ctrl+C 返回%s\n' \
+        "$YELLOW" "$RESET" "$DIM" "$(date '+%H:%M:%S')" "$RESET" \
+        "$DIM" "$interval" "$RESET"
+
+    if (( active == 0 )); then
+        printf '\n%s  这段时间里没有任何端口有流量经过。%s\n' "$DIM" "$RESET"
+        printf '%s[J' "$ESC"
+        return 0
+    fi
+
+    local head row
+    head="  $(pad '端口' 12) $(pad '协议' 8) $(pad '当前速率' 14) $(pad '连接数' 10) 限速"
+    printf '\n%s%s%s\n' "$DIM" "$head" "$RESET"
+
+    printf '%s' "$rows" | sort -rn -k1,1 | head -n "$TRAFFIC_TOP" |
+        while IFS=$'\t' read -r _delta port proto speed conns limited; do
+            if [[ -n "$port" ]]; then
+                row="  $(pad "$port" 12) $(pad "$proto" 8) $(pad "$speed" 14) $(pad "$conns" 10) $limited"
+                printf '%s\n' "$row"
+            fi
+        done
+
+    printf '\n%s  活跃端口 %s   合计 %s%s\n' \
+        "$DIM" "$active" "$(format_speed "$total" "$interval")" "$RESET"
+    if (( active > TRAFFIC_TOP )); then
+        printf '%s  只显示速率最高的 %s 个。%s\n' "$DIM" "$TRAFFIC_TOP" "$RESET"
+    fi
+    printf '%s[J' "$ESC"
+    return 0
+}
+
+traffic_loop() {
+    local interval="$1" prev cur n=0
+    local max="${TRAFFIC_REFRESH:-0}"
+
+    prev="$(conntrack_by_port)"
+    draw_traffic_screen "$prev" "$prev" "$interval"
+    while true; do
+        sleep "$interval"
+        cur="$(conntrack_by_port)"
+        draw_traffic_screen "$prev" "$cur" "$interval"
+        prev="$cur"
+        n=$((n + 1))
+        if (( max > 0 && n >= max )); then
+            break
+        fi
+    done
+}
+
+show_all_port_traffic() {
+    local interval="${1:-$TRAFFIC_INTERVAL}"
+
+    if [[ "$(conntrack_source)" == "none" ]]; then
+        clear_screen
+        draw_brand
+        printf '\n%s读不到连接跟踪表。%s\n' "$RED" "$RESET"
+        printf '%s需要 root 权限读 %s，或者系统里没有 conntrack。%s\n' \
+            "$DIM" "$CONNTRACK_FILE" "$RESET"
+        pause_screen
+        return
+    fi
+
+    # 规则用于标注"这个端口有没有被限速"
+    load_rules || true
+
+    # 父进程忽略 SIGINT，Ctrl+C 只结束刷新循环，回到菜单
+    trap '' INT
+    (
+        trap - INT
+        traffic_loop "$interval"
+    ) || true
+    trap - INT
+
+    pause_screen
+}
+
 show_limit_menu() {
     local choice
 
@@ -815,6 +1018,7 @@ show_limit_menu() {
         printf '%s6.%s 清空全部规则\n' "$GREEN" "$RESET"
         printf '%s7.%s 查看 tc 规则统计\n' "$GREEN" "$RESET"
         printf '%s8.%s 端口实时流量（每端口=每用户）\n' "$GREEN" "$RESET"
+        printf '%s9.%s 全部端口流量监控（实时刷新）\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
         read -r choice
@@ -836,9 +1040,11 @@ show_limit_menu() {
                 ;;
             8) show_port_stats
                 ;;
+            9) show_all_port_traffic
+                ;;
             0|"") return ;;
             *)
-                printf '%s请输入 1-7 或 0。%s\n' "$RED" "$RESET"
+                printf '%s请输入 1-9 或 0。%s\n' "$RED" "$RESET"
                 pause_screen
                 ;;
         esac
@@ -2686,6 +2892,11 @@ case "${1:-menu}" in
         if [[ -n "$FW_NOTES" ]]; then
             printf '\n配置文件里有被忽略的行:\n%s' "$FW_NOTES"
         fi
+        ;;
+    traffic)
+        load_rules || true
+        printf '# proto\tport\tbytes\tconnections\n'
+        conntrack_by_port
         ;;
     --help|-h)
         printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status|logs-export <条数> <路径>]\n' "$0"
