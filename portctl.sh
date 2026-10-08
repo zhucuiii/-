@@ -1132,7 +1132,7 @@ acct_remove() {
 # reset 会把内核计数器清零，所以只有在确认拿到了**完整**列表时才允许折叠：
 # 任何一次 nft 调用失败或输出异常，都必须放弃本次折叠而不是把残缺数据当真。
 acct_read_counters() {
-    local mode="${1:-read}" out rc=0 expected seen
+    local mode="${1:-read}" out rc=0 expected seen tables
 
     if [[ "$mode" == "reset" ]]; then
         out="$(nft reset counters table inet "$ACCT_TABLE" 2>&1)" || rc=$?
@@ -1141,6 +1141,13 @@ acct_read_counters() {
     fi
 
     if (( rc != 0 )); then
+        # An absent table is normal before setup, after removal or after reboot.
+        # Only a successful table listing can distinguish it from access errors.
+        if [[ "$mode" == "read" ]] &&
+            tables="$(nft list tables inet 2>/dev/null)" &&
+            ! grep -Fxq -- "table inet $ACCT_TABLE" <<<"$tables"; then
+            return 0
+        fi
         printf '[acct] nft 执行失败（退出码 %s）: %s\n' "$rc" "$out" >&2
         return 1
     fi
@@ -1189,12 +1196,16 @@ acct_load_totals() {
 
 # 已有累计 + 尚未折叠的实时计数
 acct_current() {
-    printf '%s\n%s\n' "$(acct_load_totals)" "$(acct_read_counters read)" |
+    local totals live rc=0
+    totals="$(acct_load_totals)" || rc=$?
+    live="$(acct_read_counters read)" || rc=$?
+    printf '%s\n%s\n' "$totals" "$live" |
         awk -F'\t' '
             $1 ~ /^#/ { next }
             NF >= 3 { up[$1] += $2; down[$1] += $3 }
             END { for (p in up) { printf "%s\t%d\t%d\n", p, up[p], down[p] } }
-        ' | sort -n
+        ' | sort -n || return $?
+    return "$rc"
 }
 
 # 把实时计数原子地读走并清零，累加进磁盘
@@ -1315,8 +1326,8 @@ acct_autostart_off() {
 
 # 输出: 合计<TAB>端口<TAB>上行<TAB>下行<TAB>限速，最后一行是 #TOTAL<TAB>上行<TAB>下行
 acct_rows_for_menu() {
-    local data
-    data="$(acct_current)"
+    local data rc=0
+    data="$(acct_current)" || rc=$?
     local -A up=() down=()
     local p u d
 
@@ -1340,6 +1351,7 @@ acct_rows_for_menu() {
 
     printf '%s' "$rows"
     printf '#TOTAL\t%s\t%s\n' "$tot_u" "$tot_d"
+    return "$rc"
 }
 
 show_traffic_accounting() {
@@ -1360,14 +1372,15 @@ show_traffic_accounting() {
         # 合并到一起的话，一条 [acct] 警告会被当成数据行混进表格。
         local err_file="$ACCT_ERR_FILE"
         : >"$err_file" 2>/dev/null || err_file=/dev/null
-        data="$(run_root bash "$SELF_PATH" acct-show 2>"$err_file")"
+        local acct_rc=0
+        data="$(run_root bash "$SELF_PATH" acct-show 2>"$err_file")" || acct_rc=$?
         local acct_err=""
         [[ -s "$err_file" ]] && acct_err="$(cat "$err_file")"
 
         rows="$(printf '%s\n' "$data" | grep '^[0-9]' || true)"
         total_line="$(printf '%s\n' "$data" | grep '^#TOTAL' || true)"
 
-        if [[ -n "$acct_err" ]]; then
+        if (( acct_rc != 0 )) || [[ -n "$acct_err" ]]; then
             printf '\n%s读取累计数据时有问题:%s\n%s\n' "$YELLOW" "$RESET" "$acct_err"
         fi
 
@@ -1378,7 +1391,11 @@ show_traffic_accounting() {
         n_active="${n_active:-0}"
 
         # 只显示真的有过流量的端口
-        if (( n_active == 0 )); then
+        if (( acct_rc != 0 && n_active == 0 )); then
+            printf '\n%s  本次统计读取失败，不能确认当前流量。%s\n' "$YELLOW" "$RESET"
+        elif (( n_rows == 0 )); then
+            printf '\n%s  当前没有端口规则，请先在 [01] 里配置限速端口。%s\n' "$YELLOW" "$RESET"
+        elif (( n_active == 0 )); then
             printf '\n%s  还没有任何一个端口产生过流量。%s\n' "$DIM" "$RESET"
         else
             local head row
@@ -1403,7 +1420,9 @@ show_traffic_accounting() {
                 "$(human_bytes "$((tu + td))")" "$RESET"
         fi
 
-        if acct_table_exists; then
+        if (( acct_rc != 0 )); then
+            printf '%s  统计规则: 状态未知（读取失败）%s\n' "$YELLOW" "$RESET"
+        elif acct_table_exists; then
             printf '%s  统计规则: 已建立    %s自动采样: %s%s\n' \
                 "$DIM" "$DIM" "$(acct_autostart_label)" "$RESET"
         else
@@ -3389,7 +3408,10 @@ case "${1:-menu}" in
         acct_sample
         ;;
     acct-show)
-        load_rules || true
+        if ! load_rules; then
+            printf '[acct] 无法读取端口规则: %s\n' "$RULES_ERROR" >&2
+            exit 1
+        fi
         acct_rows_for_menu
         ;;
     acct-reset)
