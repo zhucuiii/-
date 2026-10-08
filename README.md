@@ -93,12 +93,13 @@ sudo /usr/local/sbin/limit_ports.sh apply
 sudo /usr/local/sbin/limit_ports.sh apply --spec "8080=20mbit 10001-10100=8mbit"
 sudo /usr/local/sbin/limit_ports.sh apply --start-port 10001 --end-port 10100 --speed 8mbit
 sudo /usr/local/sbin/limit_ports.sh rules          # 打印解析后的规则
+sudo /usr/local/sbin/limit_ports.sh stats          # 每个端口的字节/包计数（只读）
 sudo /usr/local/sbin/limit_ports.sh plan -v        # 只打印将要执行的 tc 命令
 sudo /usr/local/sbin/limit_ports.sh status
 sudo /usr/local/sbin/limit_ports.sh stop
 ```
 
-`rules` 和 `plan` 是只读动作，不需要 root，可以用来确认配置是否正确。
+`rules`、`stats` 和 `plan` 是只读动作，不需要 root，可以用来确认配置是否正确。
 
 ## SSH 终端控制台
 
@@ -133,6 +134,7 @@ sudo ./portctl.sh
 5. 删除限速规则
 6. 清空全部规则
 7. 查看 tc 规则统计
+8. 端口实时流量（每端口=每用户）
 0. 返回主菜单
 ```
 
@@ -140,6 +142,19 @@ sudo ./portctl.sh
 - 单端口限速只输入一个端口和速率。
 - 菜单写入的规则会保存回 `/etc/default/limit-ports`，原来的注释和 `NIC`、`DEFAULT_RATE` 等配置不变。
 - 新规则如果和已有规则端口重叠，会提示将被替换的规则并要求确认。
+- **`8` 端口实时流量**：采样 3 秒，按当前速率降序列出每个端口（也就是每个用户）的实时速度、累计流量和包数：
+
+  ```text
+    端口             限速       当前速率     累计流量      包数
+    10090            50mbit     1.34 MB/s    49.97 MB      201184
+    10081            12mbit     485.0 KB/s   6.75 MB       48210
+    10099            12mbit     0 B/s        0 B           0
+
+    端口总数 4   正在跑 3   累计 0 字节 1
+    合计速率: 16.83 Mbit/s
+  ```
+
+  它同时也是**「限速到底有没有匹配上」的验证手段**：如果某个用户明明在传数据、这里却一直是 0 字节，说明这个端口的流量没被 filter 匹配到。
 - 速率输入是纯数字，单位单独选择：
 
   ```text

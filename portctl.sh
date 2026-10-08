@@ -157,7 +157,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.6.1%s\n' "$CYAN" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.6.2%s\n' "$CYAN" "$RESET"
     printf '%s输入编号进入模块，0 退出，00 刷新%s\n' "$DIM" "$RESET"
 }
 
@@ -687,6 +687,108 @@ clear_rules() {
     fi
 }
 
+# ------------------------------------------------- per-port traffic stats
+
+human_bytes() {
+    awk -v b="${1:-0}" 'BEGIN {
+        if (b >= 1073741824) printf "%.2f GB", b / 1073741824;
+        else if (b >= 1048576) printf "%.2f MB", b / 1048576;
+        else if (b >= 1024) printf "%.1f KB", b / 1024;
+        else printf "%.0f B", b;
+    }'
+}
+
+format_speed() {
+    awk -v d="${1:-0}" -v s="${2:-1}" 'BEGIN {
+        if (s <= 0) s = 1;
+        bps = d / s;
+        if (bps >= 1048576) printf "%.2f MB/s", bps / 1048576;
+        else if (bps >= 1024) printf "%.1f KB/s", bps / 1024;
+        else printf "%.0f B/s", bps;
+    }'
+}
+
+show_port_stats() {
+    local interval="${1:-${STATS_INTERVAL:-3}}"
+    local sample_a sample_b n rows total=0 active=0 idle=0
+
+    clear_screen
+    draw_brand
+    printf '\n%s[01-8] 端口实时流量%s\n' "$YELLOW" "$RESET"
+    printf '%s一个端口对应用户，速率取两次采样之间的平均值。%s\n\n' "$DIM" "$RESET"
+
+    if ! sample_a="$(limit_local stats 2>&1)"; then
+        printf '%s读取失败:%s\n%s\n' "$RED" "$RESET" "$sample_a"
+        pause_screen
+        return
+    fi
+
+    n="$(printf '%s\n' "$sample_a" | grep -c '^[0-9]' || true)"
+    if [[ "${n:-0}" == "0" ]]; then
+        printf '%s没有读到任何限速队列。%s\n' "$YELLOW" "$RESET"
+        printf '%s可能还没点「1. 立即应用当前配置」，或者规则是空的。%s\n' "$DIM" "$RESET"
+        pause_screen
+        return
+    fi
+
+    printf '%s采样中，请稍候 %s 秒...%s\n' "$DIM" "$interval" "$RESET"
+    sleep "$interval"
+    if ! sample_b="$(limit_local stats 2>&1)"; then
+        sample_b="$sample_a"
+    fi
+
+    local -A prev=()
+    while IFS=$'\t' read -r cid port rate bytes pkts drop over; do
+        [[ "$cid" =~ ^[0-9]+$ ]] || continue
+        prev["$cid"]="$bytes"
+    done <<<"$sample_a"
+
+    rows=""
+    while IFS=$'\t' read -r cid port rate bytes pkts drop over; do
+        [[ "$cid" =~ ^[0-9]+$ ]] || continue
+        local base="${prev[$cid]:-0}"
+        local delta=$((bytes - base))
+        if (( delta < 0 )); then
+            delta=0
+        fi
+        total=$((total + delta))
+        if (( delta > 0 )); then
+            active=$((active + 1))
+        fi
+        if (( bytes == 0 )); then
+            idle=$((idle + 1))
+        fi
+        rows+="$delta"$'\t'"$port"$'\t'"$rate"$'\t'"$(format_speed "$delta" "$interval")"$'\t'"$(human_bytes "$bytes")"$'\t'"$pkts"$'\n'
+    done <<<"$sample_b"
+
+    local head row
+    head="  $(pad '端口' 16) $(pad '限速' 10) $(pad '当前速率' 12) $(pad '累计流量' 13) 包数"
+    printf '\n%s%s%s\n' "$DIM" "$head" "$RESET"
+
+    printf '%s' "$rows" | sort -rn -k1,1 | head -n 25 |
+        while IFS=$'\t' read -r _delta port rate speed human pkts; do
+            if [[ -n "$port" ]]; then
+                row="  $(pad "$port" 16) $(pad "$rate" 10) $(pad "$speed" 12) $(pad "$human" 13) $pkts"
+                printf '%s\n' "$row"
+            fi
+        done
+
+    printf '\n%s  端口总数 %s   正在跑 %s   累计 0 字节 %s%s\n' \
+        "$DIM" "$n" "$active" "$idle" "$RESET"
+    printf '%s  合计速率: %s%s\n' "$DIM" \
+        "$(awk -v d="$total" -v s="$interval" 'BEGIN { printf "%.2f Mbit/s", (s > 0 ? d * 8 / s / 1e6 : 0) }')" \
+        "$RESET"
+    if (( idle > 0 )); then
+        printf '%s  提示: 累计 0 字节只说明该端口还没被用过；若某用户明明在跑却是 0，才说明没匹配上。%s\n' \
+            "$DIM" "$RESET"
+    fi
+    if (( $(printf '%s\n' "$sample_b" | grep -c '^[0-9]' || true) > 25 )); then
+        printf '%s  只显示速率最高的 25 个。%s\n' "$DIM" "$RESET"
+    fi
+
+    pause_screen
+}
+
 show_limit_menu() {
     local choice
 
@@ -712,6 +814,7 @@ show_limit_menu() {
         printf '%s5.%s 删除限速规则\n' "$GREEN" "$RESET"
         printf '%s6.%s 清空全部规则\n' "$GREEN" "$RESET"
         printf '%s7.%s 查看 tc 规则统计\n' "$GREEN" "$RESET"
+        printf '%s8.%s 端口实时流量（每端口=每用户）\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
         read -r choice
@@ -730,6 +833,8 @@ show_limit_menu() {
                 run_root tc -s qdisc show dev "$NIC" || true
                 run_root tc -s class show dev "$NIC" || true
                 pause_screen
+                ;;
+            8) show_port_stats
                 ;;
             0|"") return ;;
             *)

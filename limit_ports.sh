@@ -115,13 +115,14 @@ die() {
 usage() {
     cat <<'USAGE'
 用法:
-  limit_ports.sh [apply|stop|status|rules|plan] [选项]
+  limit_ports.sh [apply|stop|status|rules|stats|plan] [选项]
 
 动作:
   apply        应用限速规则（默认动作）
   stop         删除 root qdisc，取消全部限速
   status       显示 tc qdisc/class 统计
   rules        打印解析后的限速规则（只读，不改动系统）
+  stats        打印每个限速端口的字节/包计数（只读，供流量统计用）
   plan         打印将要执行的 tc 命令（只读，加 -v 输出完整 batch）
 
 选项:
@@ -160,7 +161,7 @@ require_option_value() {
 parse_args() {
     while (($# > 0)); do
         case "$1" in
-            apply|stop|status|rules|plan)
+            apply|stop|status|rules|stats|plan)
                 ACTION="$1"
                 shift
                 ;;
@@ -782,6 +783,41 @@ list_rules() {
     done
 }
 
+# Machine-readable per-class counters, joined with the port each class serves.
+# One port is normally one user, so this is effectively per-user accounting.
+collect_stats() {
+    local i
+    local -A port_of=() rate_of=()
+
+    for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
+        port_of["${PLAN_ID[i]}"]="$(port_match_range "${PLAN_START[i]}" "${PLAN_END[i]}")"
+        rate_of["${PLAN_ID[i]}"]="${PLAN_RATE[i]}"
+    done
+
+    printf '# class\tport\trate\tbytes\tpackets\tdropped\toverlimits\n'
+    if (( ${#PLAN_ID[@]} == 0 )); then
+        return 0
+    fi
+
+    tc -s class show dev "$NIC" 2>/dev/null | awk '
+        /^class / {
+            cid = $0
+            sub(/^class [^ ]+ 1:/, "", cid)
+            sub(/[^0-9].*$/, "", cid)
+            next
+        }
+        /Sent/ {
+            gsub(/,/, "", $7)
+            print cid "\t" $2 "\t" $4 "\t" $7 "\t" $9
+        }
+    ' | while IFS=$'\t' read -r cid bytes pkts dropped over; do
+        [[ -n "${port_of[$cid]:-}" ]] || continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$cid" "${port_of[$cid]}" "${rate_of[$cid]}" \
+            "$bytes" "$pkts" "$dropped" "$over"
+    done
+}
+
 plan_rules() {
     validate_config 0
     parse_spec "$SPEC_STRING"
@@ -875,12 +911,19 @@ main() {
             resolve_spec
             list_rules
             ;;
+        stats)
+            resolve_spec
+            validate_config 0
+            parse_spec "$SPEC_STRING"
+            build_plan
+            collect_stats
+            ;;
         plan)
             resolve_spec
             plan_rules
             ;;
         *)
-            die "用法: $0 {apply|stop|status|rules|plan}"
+            die "用法: $0 {apply|stop|status|rules|stats|plan}"
             ;;
     esac
 }
