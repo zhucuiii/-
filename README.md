@@ -119,7 +119,7 @@ sudo ./portctl.sh
 - `06` 从 GitHub 更新脚本
 - `07` 卸载程序
 
-其余菜单已经预留，后续功能可以直接添加到 `portctl.sh`。
+后续要加新模块，直接在 `portctl.sh` 里写一个 `show_xxx_menu` 函数，再到 `draw_menu` 和 `main_menu` 里各加一行即可。
 
 ### 01 端口限速
 

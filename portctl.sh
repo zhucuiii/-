@@ -157,7 +157,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.6.0%s\n' "$CYAN" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.6.1%s\n' "$CYAN" "$RESET"
     printf '%s输入编号进入模块，0 退出，00 刷新%s\n' "$DIM" "$RESET"
 }
 
@@ -178,12 +178,6 @@ draw_menu() {
     printf '%s05.%s  %s日志中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s06.%s  %s更新脚本%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s07.%s  %s卸载程序%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s08.%s  %s网络诊断%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s09.%s  %s进程查看%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s10.%s  %s连接统计%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s11.%s  %s系统资源%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s12.%s  %s配置中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s13.%s  %s扩展模块%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s----------------------------------------%s\n' "$BLUE" "$RESET"
     printf '%s00.%s  %s刷新状态%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s0.%s   %s退出控制台%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
@@ -2538,15 +2532,6 @@ uninstall_program() {
     exit 0
 }
 
-show_placeholder() {
-    local title="$1"
-    clear_screen
-    draw_brand
-    printf '\n%s%s%s\n\n' "$YELLOW" "$title" "$RESET"
-    printf '%s模块入口已预留，后续功能可以直接添加到 portctl.sh。%s\n' "$DIM" "$RESET"
-    pause_screen
-}
-
 main_menu() {
     while true; do
         clear_screen
@@ -2563,12 +2548,6 @@ main_menu() {
             5|05) show_logs_menu ;;
             6|06) update_script ;;
             7|07) uninstall_program ;;
-            8|08) show_placeholder "[08] 网络诊断" ;;
-            9|09) show_placeholder "[09] 进程查看" ;;
-            10) show_placeholder "[10] 连接统计" ;;
-            11) show_placeholder "[11] 系统资源" ;;
-            12) show_placeholder "[12] 配置中心" ;;
-            13) show_placeholder "[13] 扩展模块" ;;
             00) continue ;;
             0|q|Q)
                 clear_screen
