@@ -12,6 +12,7 @@ INSTALL_URL="${INSTALL_URL:-https://raw.githubusercontent.com/zhucuiii/-/main/in
 if [[ ! -f "$LIMIT_SCRIPT" ]]; then
     LIMIT_SCRIPT="$ROOT_DIR/limit_ports.sh"
 fi
+SELF_PATH="$ROOT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
 
 if [[ -r "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -34,6 +35,18 @@ YELLOW="${ESC}[93m"
 RED="${ESC}[91m"
 BLUE="${ESC}[94m"
 
+# 非交互场景（systemd 单元、命令行管道）不要输出颜色转义序列。
+if [[ ! -t 1 ]]; then
+    RESET=""
+    BOLD=""
+    CYAN=""
+    GREEN=""
+    DIM=""
+    YELLOW=""
+    RED=""
+    BLUE=""
+fi
+
 # Rules reported by `limit_ports.sh rules`, filled by load_rules().
 RULE_IDX=()
 RULE_START=()
@@ -44,7 +57,10 @@ RULE_PORTS=()
 RULES_ERROR=""
 
 cleanup() {
-    printf '%s[?25h%s' "$ESC" "$RESET"
+    # 非交互调用（systemd / 命令行）时不要往 stdout 写转义序列。
+    if [[ -t 1 ]]; then
+        printf '%s[?25h%s' "$ESC" "$RESET"
+    fi
 }
 trap cleanup EXIT
 
@@ -141,7 +157,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.3.0%s\n' "$CYAN" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.4.0%s\n' "$CYAN" "$RESET"
     printf '%s输入编号进入模块，0 退出，00 刷新%s\n' "$DIM" "$RESET"
 }
 
@@ -730,6 +746,1301 @@ show_limit_menu() {
     done
 }
 
+# --------------------------------------------------------------- firewall
+#
+# The firewall module keeps its own declarative rule list in
+# /etc/default/portctl-firewall.conf and owns a dedicated chain (iptables)
+# or table (nftables) per backend, so listing, deleting and clearing rules
+# are exact operations instead of scraping `iptables -L` output.
+#
+# Rule syntax, one per line:
+#     <allow|deny> <tcp|udp|all> <port|start-end|all> [from <IP|CIDR>]
+#
+# Every rule matches NEW connections only (ct state new), so applying a
+# ruleset never tears down an established session, including the SSH
+# session the menu is running in.
+
+FW_CONF_FILE="${FW_CONF_FILE:-/etc/default/portctl-firewall.conf}"
+FW_STATE_FILE="${FW_STATE_FILE:-/var/lib/portctl/firewall.ufw}"
+FW_UNIT_FILE="${FW_UNIT_FILE:-/etc/systemd/system/portctl-firewall.service}"
+FW_UNIT_NAME="portctl-firewall.service"
+FW_IPT_CHAIN="PORTCTL"
+FW_NFT_TABLE="portctl"
+
+FW_BACKEND_CFG="auto"
+FW_SSH_PROTECT="yes"
+FW_ACT=()
+FW_PROTO=()
+FW_PSTART=()
+FW_PEND=()
+FW_SRC=()
+FW_NOTES=""
+
+fw_action_label() {
+    if [[ "$1" == "allow" ]]; then
+        printf '放行'
+    else
+        printf '封禁'
+    fi
+}
+
+fw_proto_label() {
+    case "$1" in
+        tcp) printf 'tcp' ;;
+        udp) printf 'udp' ;;
+        *) printf 'all' ;;
+    esac
+}
+
+fw_ports_text() {
+    local i="$1"
+    if [[ "${FW_PSTART[i]}" == "all" ]]; then
+        printf 'all'
+    elif [[ "${FW_PSTART[i]}" == "${FW_PEND[i]}" ]]; then
+        printf '%s' "${FW_PSTART[i]}"
+    else
+        printf '%s-%s' "${FW_PSTART[i]}" "${FW_PEND[i]}"
+    fi
+}
+
+# 规范写法，必须能被 fw_load 再解析回去（写入配置文件用这个）。
+fw_rule_text() {
+    local i="$1" text
+    text="${FW_ACT[i]} ${FW_PROTO[i]} $(fw_ports_text "$i")"
+    if [[ -n "${FW_SRC[i]}" ]]; then
+        text="$text from ${FW_SRC[i]}"
+    fi
+    printf '%s' "$text"
+}
+
+# 中文写法，只用于界面显示。
+fw_rule_display() {
+    local i="$1" text
+    text="$(fw_action_label "${FW_ACT[i]}") $(fw_proto_label "${FW_PROTO[i]}") $(fw_ports_text "$i")"
+    if [[ -n "${FW_SRC[i]}" ]]; then
+        text="$text from ${FW_SRC[i]}"
+    fi
+    printf '%s' "$text"
+}
+
+fw_norm_port() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$((10#$value))"
+}
+
+is_ipv4_addr() {
+    local -a octets=()
+    IFS=. read -r -a octets <<<"${1%%/*}"
+    if (( ${#octets[@]} != 4 )); then
+        return 1
+    fi
+    local part
+    for part in "${octets[@]}"; do
+        [[ "$part" =~ ^[0-9]{1,3}$ ]] || return 1
+        (( 10#$part <= 255 )) || return 1
+    done
+    return 0
+}
+
+is_ipv6_addr() {
+    local ip="${1%%/*}"
+    [[ "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    return 0
+}
+
+is_ip_or_cidr() {
+    local value="$1" bits=""
+    [[ -n "$value" ]] || return 1
+    if [[ "$value" == */* ]]; then
+        bits="${value#*/}"
+        [[ "$bits" =~ ^[0-9]{1,3}$ ]] || return 1
+    fi
+    if is_ipv4_addr "$value"; then
+        if [[ -n "$bits" ]]; then
+            (( 10#$bits <= 32 )) || return 1
+        fi
+        return 0
+    fi
+    if is_ipv6_addr "$value"; then
+        if [[ -n "$bits" ]]; then
+            (( 10#$bits <= 128 )) || return 1
+        fi
+        return 0
+    fi
+    return 1
+}
+
+ipv4_to_int() {
+    local -a octets=()
+    IFS=. read -r -a octets <<<"$1"
+    printf '%s' "$(( (10#${octets[0]} << 24) | (10#${octets[1]} << 16) | (10#${octets[2]} << 8) | 10#${octets[3]} ))"
+}
+
+# fw_cidr_covers <network|ip> <ip>
+fw_cidr_covers() {
+    local network="$1" ip="$2"
+    [[ -n "$ip" ]] || return 1
+    if [[ "$network" == */* ]]; then
+        local base="${network%%/*}" bits="${network#*/}"
+        if [[ "$base" == *:* || "$ip" == *:* ]]; then
+            [[ "$base" == "$ip" ]] && return 0
+            return 1
+        fi
+        [[ "$bits" =~ ^[0-9]+$ ]] || return 1
+        (( bits >= 0 && bits <= 32 )) || return 1
+        local mask
+        mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+        if (( ($(ipv4_to_int "$base") & mask) == ($(ipv4_to_int "$ip") & mask) )); then
+            return 0
+        fi
+        return 1
+    fi
+    if [[ "$network" == "$ip" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+fw_parse_rule_line() {
+    local line="$1" where="$2" lineno="$3"
+    local -a fields=()
+    local action proto ports start end src="" problem="" loc="$where"
+
+    read -r -a fields <<<"$line"
+    action="${fields[0]}"
+    proto="${fields[1]:-all}"
+    ports="${fields[2]:-all}"
+
+    case "$action" in
+        allow) action="allow" ;;
+        deny|drop|reject) action="deny" ;;
+        *) problem="动作只能是 allow 或 deny" ;;
+    esac
+
+    case "${proto,,}" in
+        tcp) proto="tcp" ;;
+        udp) proto="udp" ;;
+        all|any|"") proto="all" ;;
+        *) problem="协议只能是 tcp / udp / all" ;;
+    esac
+
+    if [[ -z "$problem" ]]; then
+        if [[ "$ports" == "all" || "$ports" == "*" || "$ports" == "any" ]]; then
+            start="all"
+            end="all"
+        else
+            if [[ "$ports" == *-* ]]; then
+                start="${ports%%-*}"
+                end="${ports#*-}"
+            else
+                start="$ports"
+                end="$ports"
+            fi
+            if ! start="$(fw_norm_port "$start")" || ! end="$(fw_norm_port "$end")"; then
+                problem="端口只能是数字、区间或 all"
+            elif (( start < 1 || end > 65535 || end < start )); then
+                problem="端口区间无效: $ports"
+            fi
+        fi
+    fi
+
+    if [[ -z "$problem" ]] && (( ${#fields[@]} >= 5 )) && [[ "${fields[3]}" == "from" ]]; then
+        src="${fields[4]}"
+        if ! is_ip_or_cidr "$src"; then
+            problem="来源地址无效: $src"
+        fi
+    fi
+
+    if [[ -n "$problem" ]]; then
+        if [[ -n "$lineno" && "$lineno" != "0" ]]; then
+            loc="$where 第 $lineno 行"
+        fi
+        FW_NOTES="${FW_NOTES}  ${loc}已忽略（${problem}）: $line"$'\n'
+        return 0
+    fi
+
+    FW_ACT+=("$action")
+    FW_PROTO+=("$proto")
+    FW_PSTART+=("$start")
+    FW_PEND+=("$end")
+    FW_SRC+=("$src")
+    return 0
+}
+
+# FW_EXTRA_RULES (optional, environment) holds rules applied for this run
+# only; the menu uses it for the SSH lockout protection rule.
+fw_load() {
+    FW_BACKEND_CFG="auto"
+    FW_SSH_PROTECT="yes"
+    FW_ACT=()
+    FW_PROTO=()
+    FW_PSTART=()
+    FW_PEND=()
+    FW_SRC=()
+    FW_NOTES=""
+
+    local line lineno=0
+    local -a fields=()
+
+    if [[ -n "${FW_EXTRA_RULES:-}" ]]; then
+        while IFS= read -r line; do
+            if [[ -n "${line//[[:space:]]/}" ]]; then
+                fw_parse_rule_line "$line" "临时规则" 0
+            fi
+        done <<<"$FW_EXTRA_RULES"
+    fi
+
+    [[ -f "$FW_CONF_FILE" ]] || return 0
+
+    while IFS= read -r line; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ -z "$line" || "$line" == '#'* ]]; then
+            continue
+        fi
+        read -r -a fields <<<"$line"
+        case "${fields[0]}" in
+            backend)
+                FW_BACKEND_CFG="${fields[1]:-auto}"
+                continue
+                ;;
+            ssh-protect)
+                FW_SSH_PROTECT="${fields[1]:-yes}"
+                continue
+                ;;
+        esac
+        fw_parse_rule_line "$line" "$(basename -- "$FW_CONF_FILE")" "$lineno"
+    done <"$FW_CONF_FILE"
+
+    return 0
+}
+
+fw_save() {
+    local tmp i
+    tmp="$(mktemp)" || {
+        printf '%s无法创建临时文件。%s\n' "$RED" "$RESET"
+        return 1
+    }
+
+    {
+        printf '# portctl 防火墙规则（由控制台 [04] 菜单维护）\n'
+        printf '# 语法: <allow|deny> <tcp|udp|all> <端口|起始-结束|all> [from <IP|CIDR>]\n'
+        printf '# 规则按顺序匹配，第一条命中生效；只影响新建连接。\n'
+        printf 'backend %s\n' "$FW_BACKEND_CFG"
+        printf 'ssh-protect %s\n' "$FW_SSH_PROTECT"
+        printf '\n'
+        for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+            printf '%s\n' "$(fw_rule_text "$i")"
+        done
+    } >"$tmp"
+
+    if ! run_root install -m 0644 "$tmp" "$FW_CONF_FILE"; then
+        rm -f "$tmp"
+        printf '%s写入配置失败: %s%s\n' "$RED" "$FW_CONF_FILE" "$RESET"
+        return 1
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+fw_detect_backend() {
+    if command -v iptables >/dev/null 2>&1; then
+        printf 'iptables'
+    elif command -v nft >/dev/null 2>&1; then
+        printf 'nft'
+    elif command -v ufw >/dev/null 2>&1; then
+        printf 'ufw'
+    else
+        printf 'none'
+    fi
+}
+
+fw_backend() {
+    case "$FW_BACKEND_CFG" in
+        iptables|nft|ufw) printf '%s' "$FW_BACKEND_CFG" ;;
+        *) fw_detect_backend ;;
+    esac
+}
+
+fw_backend_label() {
+    case "$1" in
+        iptables) printf 'iptables' ;;
+        nft) printf 'nftables' ;;
+        ufw) printf 'ufw' ;;
+        *) printf '未找到' ;;
+    esac
+}
+
+# ------------------------------------------------- SSH lockout protection
+
+fw_ssh_ports() {
+    local collected="" conn="${SSH_CONNECTION:-}" port
+    if [[ -n "$conn" ]]; then
+        port="$(awk '{ print $4 }' <<<"$conn")"
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            collected="$collected $port"
+        fi
+    fi
+    if command -v sshd >/dev/null 2>&1; then
+        collected="$collected $(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2}' | tr '\n' ' ')"
+    fi
+    if [[ -r /etc/ssh/sshd_config ]]; then
+        collected="$collected $(awk 'tolower($1)=="port"{print $2}' /etc/ssh/sshd_config 2>/dev/null | tr '\n' ' ')"
+    fi
+    collected="$(printf '%s\n' $collected | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
+    if [[ -z "${collected// /}" ]]; then
+        collected="22 "
+    fi
+    printf '%s' "$collected"
+}
+
+fw_client_ip() {
+    local conn="${SSH_CONNECTION:-}"
+    if [[ -n "$conn" ]]; then
+        printf '%s' "${conn%% *}"
+    fi
+}
+
+fw_rule_covers_port() {
+    local i="$1" port="$2"
+    if [[ "${FW_PSTART[i]}" == "all" ]]; then
+        return 0
+    fi
+    if (( port >= FW_PSTART[i] && port <= FW_PEND[i] )); then
+        return 0
+    fi
+    return 1
+}
+
+# Prints the problems it finds; exits non-zero when the ruleset would cut
+# off new SSH connections.
+fw_safety_check() {
+    local ssh_ports ip i j port risky=0 covers allowed src
+    ssh_ports="$(fw_ssh_ports)"
+    ip="$(fw_client_ip)"
+
+    for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+        if [[ "${FW_ACT[i]}" != "deny" ]]; then
+            continue
+        fi
+
+        covers=0
+        for port in $ssh_ports; do
+            if fw_rule_covers_port "$i" "$port"; then
+                covers=1
+            fi
+        done
+        if (( covers == 0 )); then
+            continue
+        fi
+
+        src="${FW_SRC[i]}"
+        if [[ -n "$src" ]] && ! fw_cidr_covers "$src" "$ip"; then
+            continue
+        fi
+
+        allowed=0
+        for ((j = 0; j < i; j++)); do
+            if [[ "${FW_ACT[j]}" != "allow" ]]; then
+                continue
+            fi
+            if [[ -n "${FW_SRC[j]}" ]] && ! fw_cidr_covers "${FW_SRC[j]}" "$ip"; then
+                continue
+            fi
+            for port in $ssh_ports; do
+                if fw_rule_covers_port "$j" "$port"; then
+                    allowed=1
+                fi
+            done
+        done
+
+        if (( allowed == 0 )); then
+            printf '  规则 %s（%s）会封禁 SSH 端口 %s 的新连接\n' \
+                "$((i + 1))" "$(fw_rule_display "$i")" "$ssh_ports"
+            risky=1
+        fi
+    done
+
+    if (( risky == 0 )); then
+        return 0
+    fi
+    return 1
+}
+
+fw_ssh_protect_rule() {
+    local ip port text=""
+    ip="$(fw_client_ip)"
+    [[ -n "$ip" ]] || return 1
+    for port in $(fw_ssh_ports); do
+        text="$text"$'\n'"allow tcp $port from $ip"
+    done
+    printf '%s' "${text#$'\n'}"
+}
+
+# --------------------------------------------------------------- applying
+
+# Rules that carry no source address apply to both families.
+fw_src_family() {
+    if [[ -z "$1" ]]; then
+        printf 'both'
+    elif [[ "$1" == *:* ]]; then
+        printf '6'
+    else
+        printf '4'
+    fi
+}
+
+fw_need_family() {
+    local want="$1" i family
+    for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+        family="$(fw_src_family "${FW_SRC[i]}")"
+        if [[ "$family" == "both" || "$family" == "$want" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# "all" protocol with a specific port has to become separate tcp and udp rules.
+fw_rule_protos() {
+    local i="$1"
+    if [[ "${FW_PROTO[i]}" == "all" ]]; then
+        if [[ "${FW_PSTART[i]}" == "all" ]]; then
+            printf 'all'
+        else
+            printf 'tcp udp'
+        fi
+    else
+        printf '%s' "${FW_PROTO[i]}"
+    fi
+}
+
+fw_iptables_emit() {
+    local cmd="$1" i="$2" proto="$3"
+    local -a args=(-A "$FW_IPT_CHAIN")
+
+    if [[ -n "${FW_SRC[i]}" ]]; then
+        args+=(-s "${FW_SRC[i]}")
+    fi
+    args+=(-m conntrack --ctstate NEW)
+    if [[ "$proto" != "all" ]]; then
+        args+=(-p "$proto")
+    fi
+    if [[ "${FW_PSTART[i]}" != "all" ]]; then
+        if [[ "${FW_PSTART[i]}" == "${FW_PEND[i]}" ]]; then
+            args+=(--dport "${FW_PSTART[i]}")
+        else
+            args+=(--dport "${FW_PSTART[i]}:${FW_PEND[i]}")
+        fi
+    fi
+    if [[ "${FW_ACT[i]}" == "allow" ]]; then
+        args+=(-j ACCEPT)
+    else
+        args+=(-j DROP)
+    fi
+
+    "$cmd" "${args[@]}"
+}
+
+fw_iptables_teardown() {
+    local cmd
+    for cmd in iptables ip6tables; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        "$cmd" -D INPUT -j "$FW_IPT_CHAIN" 2>/dev/null || true
+        "$cmd" -F "$FW_IPT_CHAIN" 2>/dev/null || true
+        "$cmd" -X "$FW_IPT_CHAIN" 2>/dev/null || true
+    done
+    return 0
+}
+
+fw_iptables_apply() {
+    local -a cmds=()
+    if fw_need_family 4; then
+        cmds+=(iptables)
+    fi
+    if command -v ip6tables >/dev/null 2>&1 && fw_need_family 6; then
+        cmds+=(ip6tables)
+    fi
+
+    fw_iptables_teardown
+
+    if (( ${#cmds[@]} == 0 )); then
+        printf '[firewall] 没有规则需要下发，链 %s 已移除。\n' "$FW_IPT_CHAIN"
+        return 0
+    fi
+
+    local cmd i proto target family
+    for cmd in "${cmds[@]}"; do
+        if ! "$cmd" -N "$FW_IPT_CHAIN" 2>/dev/null; then
+            "$cmd" -F "$FW_IPT_CHAIN" 2>/dev/null || true
+        fi
+        if ! "$cmd" -I INPUT 1 -j "$FW_IPT_CHAIN"; then
+            printf '[firewall] 无法把链 %s 挂到 %s 的 INPUT 上。\n' \
+                "$FW_IPT_CHAIN" "$cmd" >&2
+            return 1
+        fi
+    done
+
+    for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+        family="$(fw_src_family "${FW_SRC[i]}")"
+        for proto in $(fw_rule_protos "$i"); do
+            for target in "${cmds[@]}"; do
+                if [[ "$family" == "4" && "$target" == "ip6tables" ]]; then
+                    continue
+                fi
+                if [[ "$family" == "6" && "$target" == "iptables" ]]; then
+                    continue
+                fi
+                fw_iptables_emit "$target" "$i" "$proto" || return 1
+            done
+        done
+    done
+
+    printf '[firewall] 已下发 %s 条规则到链 %s（%s）。\n' \
+        "${#FW_ACT[@]}" "$FW_IPT_CHAIN" "${cmds[*]}"
+    return 0
+}
+
+fw_nft_ports() {
+    local i="$1"
+    if [[ "${FW_PSTART[i]}" == "${FW_PEND[i]}" ]]; then
+        printf '%s' "${FW_PSTART[i]}"
+    else
+        printf '%s-%s' "${FW_PSTART[i]}" "${FW_PEND[i]}"
+    fi
+}
+
+fw_nft_apply() {
+    local i proto line body=""
+
+    for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+        for proto in $(fw_rule_protos "$i"); do
+            line="        "
+            if [[ -n "${FW_SRC[i]}" ]]; then
+                if [[ "${FW_SRC[i]}" == *:* ]]; then
+                    line+="ip6 saddr ${FW_SRC[i]} "
+                else
+                    line+="ip saddr ${FW_SRC[i]} "
+                fi
+            fi
+            if [[ "$proto" != "all" ]]; then
+                line+="$proto "
+                if [[ "${FW_PSTART[i]}" != "all" ]]; then
+                    line+="dport $(fw_nft_ports "$i") "
+                fi
+            fi
+            line+="ct state new "
+            if [[ "${FW_ACT[i]}" == "allow" ]]; then
+                line+="accept"
+            else
+                line+="drop"
+            fi
+            body+="$line"$'\n'
+        done
+    done
+
+    if nft list table inet "$FW_NFT_TABLE" >/dev/null 2>&1; then
+        nft delete table inet "$FW_NFT_TABLE" || return 1
+    fi
+
+    {
+        printf 'table inet %s {\n' "$FW_NFT_TABLE"
+        printf '    chain input {\n'
+        printf '        type filter hook input priority -150; policy accept;\n'
+        printf '%s' "$body"
+        printf '    }\n'
+        printf '}\n'
+    } | nft -f - || return 1
+
+    printf '[firewall] 已下发 %s 条规则到表 inet %s。\n' "${#FW_ACT[@]}" "$FW_NFT_TABLE"
+    return 0
+}
+
+fw_ports_ufw() {
+    local i="$1"
+    if [[ "${FW_PSTART[i]}" == "${FW_PEND[i]}" ]]; then
+        printf '%s' "${FW_PSTART[i]}"
+    else
+        printf '%s:%s' "${FW_PSTART[i]}" "${FW_PEND[i]}"
+    fi
+}
+
+fw_ufw_spec() {
+    local i="$1" spec ports proto
+    if [[ "${FW_ACT[i]}" == "allow" ]]; then
+        spec="allow"
+    else
+        spec="deny"
+    fi
+    proto="${FW_PROTO[i]}"
+    if [[ "${FW_PSTART[i]}" == "all" ]]; then
+        ports=""
+    else
+        ports="$(fw_ports_ufw "$i")"
+    fi
+
+    if [[ -n "${FW_SRC[i]}" ]]; then
+        spec="$spec from ${FW_SRC[i]}"
+        if [[ -n "$ports" ]]; then
+            spec="$spec to any port $ports"
+            if [[ "$proto" != "all" ]]; then
+                spec="$spec proto $proto"
+            fi
+        fi
+    elif [[ -n "$ports" ]]; then
+        if [[ "$proto" != "all" ]]; then
+            spec="$spec $ports/$proto"
+        else
+            spec="$spec $ports"
+        fi
+    else
+        spec="$spec from any"
+    fi
+
+    printf '%s' "$spec"
+}
+
+fw_ufw_teardown() {
+    [[ -r "$FW_STATE_FILE" ]] || return 0
+    local line
+    local -a args=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        read -r -a args <<<"$line"
+        ufw --force delete "${args[@]}" >/dev/null 2>&1 || true
+    done <"$FW_STATE_FILE"
+    : >"$FW_STATE_FILE" 2>/dev/null || true
+    return 0
+}
+
+fw_ufw_apply() {
+    fw_ufw_teardown
+
+    install -d -m 0755 "$(dirname -- "$FW_STATE_FILE")" || return 1
+    : >"$FW_STATE_FILE" || return 1
+
+    local i spec
+    local -a args=()
+    for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+        spec="$(fw_ufw_spec "$i")"
+        read -r -a args <<<"$spec"
+        if ! ufw "${args[@]}" >/dev/null; then
+            printf '[firewall] ufw 规则添加失败: %s\n' "$spec" >&2
+            return 1
+        fi
+        printf '%s\n' "$spec" >>"$FW_STATE_FILE"
+    done
+
+    printf '[firewall] 已通过 ufw 下发 %s 条规则。\n' "${#FW_ACT[@]}"
+    return 0
+}
+
+fw_apply_rules() {
+    case "$(fw_backend)" in
+        iptables) fw_iptables_apply ;;
+        nft) fw_nft_apply ;;
+        ufw) fw_ufw_apply ;;
+        *)
+            printf '[firewall] 找不到 iptables / nft / ufw，无法下发规则。\n' >&2
+            return 1
+            ;;
+    esac
+}
+
+fw_clear_rules() {
+    case "$(fw_backend)" in
+        iptables)
+            fw_iptables_teardown
+            printf '[firewall] 已移除链 %s。\n' "$FW_IPT_CHAIN"
+            ;;
+        nft)
+            if nft list table inet "$FW_NFT_TABLE" >/dev/null 2>&1; then
+                nft delete table inet "$FW_NFT_TABLE" \
+                    && printf '[firewall] 已删除表 inet %s。\n' "$FW_NFT_TABLE"
+            else
+                printf '[firewall] 表 inet %s 不存在。\n' "$FW_NFT_TABLE"
+            fi
+            ;;
+        ufw)
+            fw_ufw_teardown
+            printf '[firewall] 已删除本程序通过 ufw 添加的规则。\n'
+            ;;
+        *)
+            printf '[firewall] 找不到可用的防火墙工具。\n' >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------- autostart
+
+fw_installed_self() {
+    if [[ -f /usr/local/sbin/portctl.sh ]]; then
+        printf '/usr/local/sbin/portctl.sh'
+    else
+        printf '%s' "$SELF_PATH"
+    fi
+}
+
+fw_autostart_enabled() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl is-enabled "$FW_UNIT_NAME" >/dev/null 2>&1
+}
+
+fw_autostart_label() {
+    if fw_autostart_enabled; then
+        printf '已开启'
+    else
+        printf '未开启'
+    fi
+}
+
+fw_unit_write() {
+    local tmp self
+    self="$(fw_installed_self)"
+    tmp="$(mktemp)" || return 1
+
+    {
+        printf '[Unit]\n'
+        printf 'Description=portctl firewall rules\n'
+        printf 'Wants=network-online.target\n'
+        printf 'After=network-online.target\n\n'
+        printf '[Service]\n'
+        printf 'Type=oneshot\n'
+        printf 'ExecStart=%s firewall-apply\n' "$self"
+        printf 'ExecStop=%s firewall-clear\n' "$self"
+        printf 'RemainAfterExit=yes\n\n'
+        printf '[Install]\n'
+        printf 'WantedBy=multi-user.target\n'
+    } >"$tmp"
+
+    if ! run_root install -m 0644 "$tmp" "$FW_UNIT_FILE"; then
+        rm -f "$tmp"
+        printf '%s写入 systemd 单元失败。%s\n' "$RED" "$RESET"
+        return 1
+    fi
+    rm -f "$tmp"
+    run_root systemctl daemon-reload || true
+    return 0
+}
+
+fw_autostart_on() {
+    fw_unit_write || return 1
+    run_root systemctl enable --now "$FW_UNIT_NAME"
+}
+
+fw_autostart_off() {
+    if command -v systemctl >/dev/null 2>&1; then
+        run_root systemctl disable --now "$FW_UNIT_NAME" 2>/dev/null || true
+    fi
+    run_root rm -f "$FW_UNIT_FILE"
+    if command -v systemctl >/dev/null 2>&1; then
+        run_root systemctl daemon-reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------- firewall UI
+
+fw_render_table() {
+    if (( ${#FW_ACT[@]} == 0 )); then
+        printf '%s  当前没有任何防火墙规则。%s\n' "$DIM" "$RESET"
+        return 0
+    fi
+
+    local i row
+    row="  $(pad '编号' 6) $(pad '动作' 8) $(pad '协议' 8) $(pad '端口' 18) 来源"
+    printf '%s%s%s\n' "$DIM" "$row" "$RESET"
+
+    for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+        row="  $(pad "$((i + 1))" 6) $(pad "$(fw_action_label "${FW_ACT[i]}")" 8) $(pad "$(fw_proto_label "${FW_PROTO[i]}")" 8) $(pad "$(fw_ports_text "$i")" 18) ${FW_SRC[i]:-任意}"
+        if [[ "${FW_ACT[i]}" == "allow" ]]; then
+            printf '%s%s%s\n' "$GREEN" "$row" "$RESET"
+        else
+            printf '%s%s%s\n' "$RED" "$row" "$RESET"
+        fi
+    done
+    return 0
+}
+
+fw_prompt_action() {
+    local choice
+    printf '%s请选择动作:%s\n' "$CYAN" "$RESET" >&2
+    printf '%s1.%s 放行（allow）\n' "$GREEN" "$RESET" >&2
+    printf '%s2.%s 封禁（deny）\n' "$GREEN" "$RESET" >&2
+    printf '%s选择:%s ' "$CYAN" "$RESET" >&2
+    read -r choice || return 1
+    case "$choice" in
+        ""|1) printf 'allow' ;;
+        2) printf 'deny' ;;
+        *) return 1 ;;
+    esac
+}
+
+fw_prompt_proto() {
+    local choice
+    printf '%s请选择协议:%s\n' "$CYAN" "$RESET" >&2
+    printf '%s1.%s tcp\n' "$GREEN" "$RESET" >&2
+    printf '%s2.%s udp\n' "$GREEN" "$RESET" >&2
+    printf '%s3.%s tcp + udp\n' "$GREEN" "$RESET" >&2
+    printf '%s选择 [1]:%s ' "$CYAN" "$RESET" >&2
+    read -r choice || return 1
+    case "$choice" in
+        ""|1) printf 'tcp' ;;
+        2) printf 'udp' ;;
+        3) printf 'all' ;;
+        *) return 1 ;;
+    esac
+}
+
+# Prints "<start> <end>"; "all all" means every port.
+fw_prompt_ports() {
+    local prompt="$1" allow_empty="${2:-no}" value start end
+    while true; do
+        printf '%s%s%s ' "$CYAN" "$prompt" "$RESET" >&2
+        read -r value || return 1
+
+        if [[ -z "$value" ]]; then
+            if [[ "$allow_empty" == "yes" ]]; then
+                printf 'all all'
+                return 0
+            fi
+            printf '%s不能为空。%s\n' "$RED" "$RESET" >&2
+            continue
+        fi
+        if [[ "$value" == "all" || "$value" == "*" ]]; then
+            printf 'all all'
+            return 0
+        fi
+
+        if [[ "$value" == *-* ]]; then
+            start="${value%%-*}"
+            end="${value#*-}"
+        else
+            start="$value"
+            end="$value"
+        fi
+
+        if ! start="$(fw_norm_port "$start")" || ! end="$(fw_norm_port "$end")"; then
+            printf '%s请输入单个端口或区间，例如 8080、10001-10200。%s\n' "$RED" "$RESET" >&2
+            continue
+        fi
+        if (( start < 1 || end > 65535 || end < start )); then
+            printf '%s端口必须在 1-65535 之间，且结束端口不小于起始端口。%s\n' "$RED" "$RESET" >&2
+            continue
+        fi
+
+        printf '%s %s' "$start" "$end"
+        return 0
+    done
+}
+
+fw_prompt_ip() {
+    local prompt="$1" value
+    while true; do
+        printf '%s%s%s ' "$CYAN" "$prompt" "$RESET" >&2
+        read -r value || return 1
+        if is_ip_or_cidr "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+        printf '%s地址格式无效，例如 1.2.3.4、1.2.3.0/24、2001:db8::/32。%s\n' \
+            "$RED" "$RESET" >&2
+    done
+}
+
+fw_prompt_src_optional() {
+    local value
+    while true; do
+        printf '%s来源 IP（留空表示任意来源）:%s ' "$CYAN" "$RESET" >&2
+        read -r value || return 1
+        if [[ -z "$value" ]]; then
+            printf ''
+            return 0
+        fi
+        if is_ip_or_cidr "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+        printf '%s地址格式无效。%s\n' "$RED" "$RESET" >&2
+    done
+}
+
+fw_apply_from_menu() {
+    local risk_out answer extra="" ip
+    fw_load
+
+    if risk_out="$(fw_safety_check)"; then
+        extra=""
+    else
+        printf '\n%s警告: 下面的规则可能会切断你的 SSH 登录%s\n' "$RED" "$RESET"
+        printf '%s\n' "$risk_out"
+        printf '\n%s规则只影响新建连接，当前会话不会掉线，但下次登录可能连不上。%s\n' \
+            "$DIM" "$RESET"
+
+        ip="$(fw_client_ip)"
+        if [[ -n "$ip" && "$FW_SSH_PROTECT" == "yes" ]]; then
+            printf '\n%s是否自动加一条「允许当前 IP %s 访问 SSH 端口」的保护规则？[Y/n]:%s ' \
+                "$CYAN" "$ip" "$RESET"
+            read -r answer
+            if [[ -z "$answer" || "${answer,,}" == "y" || "${answer,,}" == "yes" ]]; then
+                extra="$(fw_ssh_protect_rule)"
+                printf '%s临时保护规则:%s\n%s\n' "$GREEN" "$RESET" "$extra"
+            fi
+        fi
+
+        printf '\n%s确认下发请输入 FORCE，其他输入取消: %s' "$YELLOW" "$RESET"
+        read -r answer
+        if [[ "$answer" != "FORCE" ]]; then
+            printf '%s已取消。%s\n' "$DIM" "$RESET"
+            pause_screen
+            return
+        fi
+    fi
+
+    printf '\n'
+    if run_root env FW_EXTRA_RULES="$extra" bash "$SELF_PATH" firewall-apply; then
+        printf '\n%s规则已下发到系统防火墙。%s\n' "$GREEN" "$RESET"
+    else
+        printf '\n%s下发失败，请检查上面的错误输出。%s\n' "$RED" "$RESET"
+    fi
+    pause_screen
+}
+
+fw_apply_after_change() {
+    local answer
+    printf '\n%s现在立即下发到系统防火墙？[Y/n]:%s ' "$CYAN" "$RESET"
+    read -r answer
+    if [[ -z "$answer" || "${answer,,}" == "y" || "${answer,,}" == "yes" ]]; then
+        printf '\n'
+        fw_apply_from_menu
+    else
+        printf '%s已保存配置，之后可在菜单里选择「1. 立即应用当前配置」。%s\n' \
+            "$DIM" "$RESET"
+        pause_screen
+    fi
+}
+
+fw_add_port_flow() {
+    local action proto ports_pair start end src
+
+    clear_screen
+    draw_brand
+    printf '\n%s[04-2] 添加端口规则%s\n\n' "$YELLOW" "$RESET"
+
+    action="$(fw_prompt_action)" || {
+        pause_screen
+        return
+    }
+    proto="$(fw_prompt_proto)" || {
+        pause_screen
+        return
+    }
+    ports_pair="$(fw_prompt_ports '端口（单个或区间，例如 8080 或 10001-10200）:')" || {
+        pause_screen
+        return
+    }
+    read -r start end <<<"$ports_pair"
+    src="$(fw_prompt_src_optional)" || {
+        pause_screen
+        return
+    }
+
+    fw_load
+    FW_ACT+=("$action")
+    FW_PROTO+=("$proto")
+    FW_PSTART+=("$start")
+    FW_PEND+=("$end")
+    FW_SRC+=("$src")
+
+    printf '\n%s新规则:%s %s\n' "$DIM" "$RESET" "$(fw_rule_display "$((${#FW_ACT[@]} - 1))")"
+    if fw_save; then
+        printf '%s已写入 %s%s\n' "$GREEN" "$FW_CONF_FILE" "$RESET"
+        fw_apply_after_change
+    else
+        pause_screen
+    fi
+}
+
+fw_add_ip_flow() {
+    local action ip ports_pair start end
+
+    clear_screen
+    draw_brand
+    printf '\n%s[04-3] 添加来源 IP 规则%s\n\n' "$YELLOW" "$RESET"
+
+    action="$(fw_prompt_action)" || {
+        pause_screen
+        return
+    }
+    ip="$(fw_prompt_ip '来源 IP 或网段（例如 1.2.3.4 或 1.2.3.0/24）:')" || {
+        pause_screen
+        return
+    }
+    printf '%s端口留空表示该 IP 的所有端口。%s\n' "$DIM" "$RESET"
+    ports_pair="$(fw_prompt_ports '端口（可留空）:' yes)" || {
+        pause_screen
+        return
+    }
+    read -r start end <<<"$ports_pair"
+
+    fw_load
+    FW_ACT+=("$action")
+    FW_PROTO+=("all")
+    FW_PSTART+=("$start")
+    FW_PEND+=("$end")
+    FW_SRC+=("$ip")
+
+    printf '\n%s新规则:%s %s\n' "$DIM" "$RESET" "$(fw_rule_display "$((${#FW_ACT[@]} - 1))")"
+    if fw_save; then
+        printf '%s已写入 %s%s\n' "$GREEN" "$FW_CONF_FILE" "$RESET"
+        fw_apply_after_change
+    else
+        pause_screen
+    fi
+}
+
+fw_delete_flow() {
+    local answer token found i skip
+    local -a remove=()
+
+    clear_screen
+    draw_brand
+    printf '\n%s[04-4] 删除规则%s\n\n' "$YELLOW" "$RESET"
+
+    fw_load
+    fw_render_table
+    if (( ${#FW_ACT[@]} == 0 )); then
+        pause_screen
+        return
+    fi
+
+    printf '\n%s输入要删除的规则编号（多个用空格分隔，直接回车取消）:%s ' "$CYAN" "$RESET"
+    read -r answer
+    if [[ -z "$answer" ]]; then
+        pause_screen
+        return
+    fi
+
+    read -r -a remove <<<"$answer"
+    for token in "${remove[@]}"; do
+        if ! [[ "$token" =~ ^[0-9]+$ ]]; then
+            printf '%s规则编号无效: %s%s\n' "$RED" "$token" "$RESET"
+            pause_screen
+            return
+        fi
+        if (( token < 1 || token > ${#FW_ACT[@]} )); then
+            printf '%s没有编号为 %s 的规则。%s\n' "$RED" "$token" "$RESET"
+            pause_screen
+            return
+        fi
+    done
+
+    local -a act=() proto=() pstart=() pend=() src=()
+    for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+        skip=0
+        for token in "${remove[@]}"; do
+            if (( token == i + 1 )); then
+                skip=1
+            fi
+        done
+        if (( skip )); then
+            continue
+        fi
+        act+=("${FW_ACT[i]}")
+        proto+=("${FW_PROTO[i]}")
+        pstart+=("${FW_PSTART[i]}")
+        pend+=("${FW_PEND[i]}")
+        src+=("${FW_SRC[i]}")
+    done
+
+    FW_ACT=(${act[@]+"${act[@]}"})
+    FW_PROTO=(${proto[@]+"${proto[@]}"})
+    FW_PSTART=(${pstart[@]+"${pstart[@]}"})
+    FW_PEND=(${pend[@]+"${pend[@]}"})
+    FW_SRC=(${src[@]+"${src[@]}"})
+
+    printf '\n%s删除后剩余规则:%s\n' "$DIM" "$RESET"
+    fw_render_table
+    if fw_save; then
+        printf '%s已写入 %s%s\n' "$GREEN" "$FW_CONF_FILE" "$RESET"
+        fw_apply_after_change
+    else
+        pause_screen
+    fi
+}
+
+fw_clear_flow() {
+    local answer
+    clear_screen
+    draw_brand
+    printf '\n%s[04-5] 清空全部规则%s\n\n' "$YELLOW" "$RESET"
+
+    fw_load
+    fw_render_table
+    printf '\n%s清空后不会立刻撤销系统里的规则，需要再选「1. 立即应用当前配置」才会移除链/表。%s\n' \
+        "$DIM" "$RESET"
+    printf '确认清空请输入 %sYES%s，其他输入取消: ' "$RED" "$RESET"
+    read -r answer
+    if [[ "$answer" != "YES" ]]; then
+        printf '%s已取消。%s\n' "$DIM" "$RESET"
+        pause_screen
+        return
+    fi
+
+    FW_ACT=()
+    FW_PROTO=()
+    FW_PSTART=()
+    FW_PEND=()
+    FW_SRC=()
+    if fw_save; then
+        printf '%s已清空配置里的规则。%s\n' "$GREEN" "$RESET"
+        fw_apply_after_change
+    else
+        pause_screen
+    fi
+}
+
+fw_show_system_rules() {
+    clear_screen
+    draw_brand
+    printf '\n%s[04-6] 系统实际规则%s\n\n' "$YELLOW" "$RESET"
+
+    case "$(fw_backend)" in
+        iptables)
+            printf '%s--- iptables -S INPUT ---%s\n' "$DIM" "$RESET"
+            run_root iptables -S INPUT 2>&1 || true
+            printf '\n%s--- iptables -S %s ---%s\n' "$DIM" "$FW_IPT_CHAIN" "$RESET"
+            run_root iptables -S "$FW_IPT_CHAIN" 2>&1 ||
+                printf '%s链不存在（尚未下发）%s\n' "$DIM" "$RESET"
+            printf '\n%s--- 命中计数 ---%s\n' "$DIM" "$RESET"
+            run_root iptables -L "$FW_IPT_CHAIN" -n -v 2>&1 || true
+            if command -v ip6tables >/dev/null 2>&1; then
+                printf '\n%s--- ip6tables -S %s ---%s\n' "$DIM" "$FW_IPT_CHAIN" "$RESET"
+                run_root ip6tables -S "$FW_IPT_CHAIN" 2>&1 || true
+            fi
+            ;;
+        nft)
+            run_root nft list table inet "$FW_NFT_TABLE" 2>&1 ||
+                printf '%s表不存在（尚未下发）%s\n' "$DIM" "$RESET"
+            ;;
+        ufw)
+            run_root ufw status numbered 2>&1 || true
+            ;;
+        *)
+            printf '%s找不到可用的防火墙工具。%s\n' "$RED" "$RESET"
+            ;;
+    esac
+
+    pause_screen
+}
+
+fw_settings_menu() {
+    local choice
+    clear_screen
+    draw_brand
+    printf '\n%s[04-7] 后端与开机自启%s\n\n' "$YELLOW" "$RESET"
+    printf '%s自动探测结果:%s %s\n' "$DIM" "$RESET" "$(fw_backend_label "$(fw_detect_backend)")"
+    printf '%s当前设置:%s %s → %s\n' \
+        "$DIM" "$RESET" "$FW_BACKEND_CFG" "$(fw_backend_label "$(fw_backend)")"
+    printf '%s开机自启:%s %s\n\n' "$DIM" "$RESET" "$(fw_autostart_label)"
+
+    printf '%s1.%s 自动探测（auto）\n' "$GREEN" "$RESET"
+    printf '%s2.%s 固定使用 iptables\n' "$GREEN" "$RESET"
+    printf '%s3.%s 固定使用 nftables\n' "$GREEN" "$RESET"
+    printf '%s4.%s 固定使用 ufw\n' "$GREEN" "$RESET"
+    printf '%s5.%s 开启开机自动恢复\n' "$GREEN" "$RESET"
+    printf '%s6.%s 关闭并删除开机自启单元\n' "$GREEN" "$RESET"
+    printf '%s0.%s 返回\n\n' "$GREEN" "$RESET"
+    printf '%s选择:%s ' "$CYAN" "$RESET"
+    read -r choice
+
+    case "$choice" in
+        1|2|3|4)
+            case "$choice" in
+                1) FW_BACKEND_CFG="auto" ;;
+                2) FW_BACKEND_CFG="iptables" ;;
+                3) FW_BACKEND_CFG="nft" ;;
+                4) FW_BACKEND_CFG="ufw" ;;
+            esac
+            if fw_save; then
+                printf '%s后端已设置为: %s%s\n' "$GREEN" "$FW_BACKEND_CFG" "$RESET"
+            fi
+            pause_screen
+            ;;
+        5)
+            if fw_autostart_on; then
+                printf '%s已开启开机自动恢复。%s\n' "$GREEN" "$RESET"
+            else
+                printf '%s开启失败。%s\n' "$RED" "$RESET"
+            fi
+            pause_screen
+            ;;
+        6)
+            fw_autostart_off
+            printf '%s已关闭并删除 %s。%s\n' "$GREEN" "$FW_UNIT_FILE" "$RESET"
+            pause_screen
+            ;;
+        0|"") return ;;
+        *) printf '%s未知选项。%s\n' "$RED" "$RESET"; pause_screen ;;
+    esac
+}
+
+show_firewall_menu() {
+    local choice ip
+    while true; do
+        fw_load
+        clear_screen
+        draw_brand
+        printf '\n%s[04] 防火墙规则%s\n' "$YELLOW" "$RESET"
+        printf '%s后端:%s %s    %s开机自启:%s %s\n' \
+            "$DIM" "$RESET" "$(fw_backend_label "$(fw_backend)")" \
+            "$DIM" "$RESET" "$(fw_autostart_label)"
+        printf '%sSSH 端口:%s %s' "$DIM" "$RESET" "$(fw_ssh_ports)"
+        ip="$(fw_client_ip)"
+        if [[ -n "$ip" ]]; then
+            printf '    %s当前连接来源:%s %s' "$DIM" "$RESET" "$ip"
+        fi
+        printf '\n%s规则只影响新建连接，不会中断已建立的会话。%s\n' "$DIM" "$RESET"
+
+        printf '\n%s当前规则（按顺序匹配，第一条命中生效）%s\n' "$CYAN" "$RESET"
+        fw_render_table
+        if [[ -n "$FW_NOTES" ]]; then
+            printf '\n%s配置文件里有被忽略的行:%s\n%s' "$YELLOW" "$RESET" "$FW_NOTES"
+        fi
+
+        printf '\n%s1.%s 立即应用当前配置\n' "$GREEN" "$RESET"
+        printf '%s2.%s 添加端口规则（放行 / 封禁）\n' "$GREEN" "$RESET"
+        printf '%s3.%s 添加来源 IP 规则（放行 / 封禁）\n' "$GREEN" "$RESET"
+        printf '%s4.%s 删除规则\n' "$GREEN" "$RESET"
+        printf '%s5.%s 清空全部规则\n' "$GREEN" "$RESET"
+        printf '%s6.%s 查看系统实际规则\n' "$GREEN" "$RESET"
+        printf '%s7.%s 后端与开机自启设置\n' "$GREEN" "$RESET"
+        printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice
+
+        case "$choice" in
+            1) fw_apply_from_menu ;;
+            2) fw_add_port_flow ;;
+            3) fw_add_ip_flow ;;
+            4) fw_delete_flow ;;
+            5) fw_clear_flow ;;
+            6) fw_show_system_rules ;;
+            7) fw_settings_menu ;;
+            0|"") return ;;
+            *)
+                printf '%s请输入 1-7 或 0。%s\n' "$RED" "$RESET"
+                pause_screen
+                ;;
+        esac
+    done
+}
+
 show_system_info() {
     clear_screen
     draw_brand
@@ -822,6 +2133,7 @@ uninstall_program() {
     draw_brand
     printf '\n%s[07] 卸载程序%s\n\n' "$YELLOW" "$RESET"
     printf '%s这将停止服务并删除 zc、portctl.sh 和 limit_ports.sh。%s\n' "$RED" "$RESET"
+    printf '%s同时会移除 portctl-firewall.service（不会主动撤销已下发的防火墙规则）。%s\n' "$DIM" "$RESET"
     printf '%s默认保留 /etc/default/limit-ports 配置。%s\n\n' "$DIM" "$RESET"
     printf '确认卸载请输入 %sYES%s，其他输入取消: ' "$RED" "$RESET"
     read -r confirmation
@@ -836,6 +2148,8 @@ uninstall_program() {
     if command -v systemctl >/dev/null 2>&1; then
         run_root systemctl disable --now limit-ports.service 2>/dev/null || true
         run_root rm -f /etc/systemd/system/limit-ports.service
+        run_root systemctl disable --now "$FW_UNIT_NAME" 2>/dev/null || true
+        run_root rm -f "$FW_UNIT_FILE"
         run_root systemctl daemon-reload 2>/dev/null || true
     fi
     run_root rm -f /usr/local/bin/zc
@@ -843,6 +2157,7 @@ uninstall_program() {
     run_root rm -f /usr/local/sbin/limit_ports.sh
     if [[ "${remove_config,,}" == "y" || "${remove_config,,}" == "yes" ]]; then
         run_root rm -f /etc/default/limit-ports
+        run_root rm -f "$FW_CONF_FILE"
     fi
     printf '%s卸载完成。%s\n' "$GREEN" "$RESET"
     printf '%s当前菜单进程将在返回后退出。%s\n' "$DIM" "$RESET"
@@ -872,7 +2187,7 @@ main_menu() {
             1|01) show_limit_menu ;;
             2|02) show_system_info ;;
             3|03) show_service_menu ;;
-            4|04) show_placeholder "[04] 防火墙规则" ;;
+            4|04) show_firewall_menu ;;
             5|05) show_logs ;;
             6|06) update_script ;;
             7|07) uninstall_program ;;
@@ -895,8 +2210,26 @@ main_menu() {
 
 case "${1:-menu}" in
     menu) main_menu ;;
+    firewall-apply)
+        fw_load
+        fw_apply_rules
+        ;;
+    firewall-clear)
+        fw_load
+        fw_clear_rules
+        ;;
+    firewall-status)
+        fw_load
+        printf '后端: %s\n' "$(fw_backend_label "$(fw_backend)")"
+        printf '配置文件: %s\n' "$FW_CONF_FILE"
+        printf '规则: %s 条\n' "${#FW_ACT[@]}"
+        fw_render_table
+        if [[ -n "$FW_NOTES" ]]; then
+            printf '\n配置文件里有被忽略的行:\n%s' "$FW_NOTES"
+        fi
+        ;;
     --help|-h)
-        printf '用法: %s [menu]\n' "$0"
+        printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status]\n' "$0"
         printf 'SSH 登录服务器后直接运行即可。默认进入交互式终端菜单。\n'
         ;;
     *)

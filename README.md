@@ -114,6 +114,7 @@ sudo ./portctl.sh
 - `01` 端口限速
 - `02` 系统信息
 - `03` 服务管理
+- `04` 防火墙规则
 - `05` 日志中心
 - `06` 从 GitHub 更新脚本
 - `07` 卸载程序
@@ -148,6 +149,61 @@ sudo ./portctl.sh
   4. GB/s
   ```
 
+### 04 防火墙规则
+
+`04` 用一个声明式规则文件管理防火墙，规则保存在 `/etc/default/portctl-firewall.conf`：
+
+```text
+backend auto
+ssh-protect yes
+
+allow tcp 22
+allow tcp 10001-10200
+deny tcp 3306
+allow tcp 8080 from 1.2.3.4
+deny all all from 198.51.100.0/24
+```
+
+一条规则的语法是：
+
+```text
+<allow|deny> <tcp|udp|all> <端口|起始-结束|all> [from <IP|CIDR>]
+```
+
+菜单里可以：
+
+```text
+1. 立即应用当前配置
+2. 添加端口规则（放行 / 封禁）
+3. 添加来源 IP 规则（放行 / 封禁）
+4. 删除规则
+5. 清空全部规则
+6. 查看系统实际规则
+7. 后端与开机自启设置
+0. 返回主菜单
+```
+
+几个关键设计：
+
+- **后端自动探测**：按 `iptables → nftables → ufw` 的顺序选择，也可以在 `7` 里固定。
+- **规则只影响新建连接**（`ct state new`）：下发规则不会中断已经建立的会话，包括你正在使用的 SSH。
+- **独占自己的链/表**：iptables 用 `PORTCTL` 链，nftables 用 `inet portctl` 表。删除和清空是精确操作，不会误删你原有的规则。
+  链会被插到 `INPUT` 的第一位，所以放行规则才能生效；不匹配的流量原样穿过，继续走你原有的规则。
+- **只有链不碰策略**：脚本不会修改 `INPUT` 的默认策略，也不会关闭你的防火墙。
+- **SSH 防锁死**：下发前会检查规则是否封禁了 SSH 端口（端口从 `SSH_CONNECTION`、`sshd -T`、`sshd_config` 依次探测），
+  有风险时会告警并要求输入 `FORCE` 才继续，还会主动提出加一条「允许当前 IP 访问 SSH 端口」的临时保护规则
+  （只在下发时生效，不写入配置文件）。
+- **开机自动恢复**：`7` 里开启后会生成 `portctl-firewall.service`（`ExecStart` 调 `portctl.sh firewall-apply`，
+  `ExecStop` 调 `firewall-clear`），不依赖 `iptables-persistent` 之类的额外软件包。
+
+不开菜单也可以直接用命令行：
+
+```bash
+sudo /usr/local/sbin/portctl.sh firewall-apply     # 按配置下发（systemd 调用的就是它）
+sudo /usr/local/sbin/portctl.sh firewall-status    # 只看解析结果，不需要 root
+sudo /usr/local/sbin/portctl.sh firewall-clear     # 移除本程序创建的链/表
+```
+
 ## 说明
 
 - 当前规则塑形的是出口流量，使用服务端 TCP/UDP 源端口匹配。
@@ -155,3 +211,5 @@ sudo ./portctl.sh
 - 脚本会接管网卡的整个 root qdisc，不能与其他 QoS、Docker 或 Kubernetes 流量控制直接叠加。
 - `DEFAULT_RATE` 应设置为服务器实际链路速率，用于承载未匹配的流量。
 - 区间共享（`@shared`）会让整段端口共用一条 HTB 队列，端口很多时建议用它，减少 `tc` 队列数量。
+- 防火墙规则按文件里的顺序匹配，所以「先放行某个 IP，再封禁整段」的白名单写法是有效的；但 `ufw` 后端由 ufw 自己排列规则顺序，这种写法不保证生效，需要严格顺序时请用 `iptables` 或 `nftables` 后端。
+- 本程序不会接管或清空系统已有的防火墙规则，卸载时也不会主动撤销已下发的规则（`sudo portctl.sh firewall-clear` 可以手动清掉）。
