@@ -157,7 +157,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.4.0%s\n' "$CYAN" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.5.0%s\n' "$CYAN" "$RESET"
     printf '%s输入编号进入模块，0 退出，00 刷新%s\n' "$DIM" "$RESET"
 }
 
@@ -2086,13 +2086,385 @@ show_service_menu() {
     esac
 }
 
-show_logs() {
+# ------------------------------------------------------------- log center
+
+LOG_DIR="${LOG_DIR:-/var/log}"
+
+log_backend() {
+    if command -v journalctl >/dev/null 2>&1; then
+        printf 'journald'
+    elif [[ -e "$LOG_DIR/syslog" ]]; then
+        printf 'syslog'
+    elif [[ -e "$LOG_DIR/messages" ]]; then
+        printf 'messages'
+    else
+        printf 'none'
+    fi
+}
+
+log_persistent() {
+    if [[ -d /var/log/journal ]]; then
+        printf '是'
+    else
+        printf '否（只在内存，重启即丢）'
+    fi
+}
+
+log_disk_usage() {
+    local out
+    if [[ "$(log_backend)" != "journald" ]]; then
+        printf '—'
+        return 0
+    fi
+    # 不加 sudo：避免菜单每次重绘都弹密码提示。
+    out="$(journalctl --disk-usage 2>/dev/null | head -n 1 || true)"
+    # journalctl 输出形如 "... take up 88.0M in the file system."
+    if [[ "$out" =~ ([0-9.]+[KMGTP]i?B?) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf '未知'
+    fi
+}
+
+log_prompt_lines() {
+    local value count
+    printf '%s显示条数 [40]:%s ' "$CYAN" "$RESET" >&2
+    read -r value || return 1
+    if [[ -z "$value" ]]; then
+        printf '40'
+        return 0
+    fi
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s请输入数字，使用默认值 40。%s\n' "$RED" "$RESET" >&2
+        printf '40'
+        return 0
+    fi
+    count=$((10#$value))
+    if (( count < 1 )); then
+        count=1
+    fi
+    if (( count > 5000 )); then
+        count=5000
+    fi
+    printf '%s' "$count"
+    return 0
+}
+
+# log_emit <标题> <行数> <syslog 过滤模式或 -> [journalctl 参数...]
+log_emit() {
+    local title="$1" lines="$2" pattern="$3"
+    shift 3
+
     clear_screen
     draw_brand
-    printf '\n%s[05] 日志中心%s\n\n' "$YELLOW" "$RESET"
-    journalctl -u limit-ports.service -n 40 --no-pager 2>/dev/null ||
-        printf '%s暂无 systemd 日志。%s\n' "$DIM" "$RESET"
+    printf '\n%s%s%s\n' "$YELLOW" "$title" "$RESET"
+    printf '%s最近 %s 条 · %s%s\n\n' "$DIM" "$lines" "$(date '+%F %T')" "$RESET"
+
+    case "$(log_backend)" in
+        journald)
+            run_root journalctl -n "$lines" --no-pager "$@" 2>&1 || true
+            ;;
+        syslog|messages)
+            printf '%s系统没有 journald，下面显示 %s/%s 的内容。%s\n\n' \
+                "$DIM" "$LOG_DIR" "$(log_backend)" "$RESET"
+            if [[ -n "$pattern" && "$pattern" != "-" ]]; then
+                run_root grep -iE "$pattern" "$LOG_DIR/$(log_backend)" 2>/dev/null |
+                    tail -n "$lines" || true
+            else
+                run_root tail -n "$lines" "$LOG_DIR/$(log_backend)" 2>&1 || true
+            fi
+            ;;
+        *)
+            printf '%s找不到日志来源（没有 journalctl，也没有 /var/log/syslog 或 /var/log/messages）。%s\n' \
+                "$RED" "$RESET"
+            ;;
+    esac
+
     pause_screen
+}
+
+log_ssh_unit() {
+    if systemctl cat ssh.service >/dev/null 2>&1; then
+        printf 'ssh'
+    elif systemctl cat sshd.service >/dev/null 2>&1; then
+        printf 'sshd'
+    fi
+}
+
+log_view_login() {
+    local lines unit
+    lines="$(log_prompt_lines)" || return 0
+
+    clear_screen
+    draw_brand
+    printf '\n%s登录记录%s\n' "$YELLOW" "$RESET"
+    printf '%s最近 %s 条 · %s%s\n' "$DIM" "$lines" "$(date '+%F %T')" "$RESET"
+
+    printf '\n%s--- 成功登录（last）---%s\n' "$CYAN" "$RESET"
+    if command -v last >/dev/null 2>&1; then
+        run_root last -n "$lines" -w 2>&1 || true
+    else
+        printf '%s系统没有 last 命令。%s\n' "$DIM" "$RESET"
+    fi
+
+    printf '\n%s--- 失败登录（lastb）---%s\n' "$CYAN" "$RESET"
+    if command -v lastb >/dev/null 2>&1; then
+        run_root lastb -n "$lines" -w 2>&1 || true
+    else
+        printf '%s系统没有 lastb 命令。%s\n' "$DIM" "$RESET"
+    fi
+
+    if [[ "$(log_backend)" == "journald" ]]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            unit="$(log_ssh_unit)"
+            if [[ -n "$unit" ]]; then
+                printf '\n%s--- SSH 认证日志（%s）---%s\n' "$CYAN" "$unit" "$RESET"
+                run_root journalctl -u "$unit" -n "$((lines * 4))" --no-pager 2>&1 |
+                    grep -iE 'accepted|failed|invalid|refused|disconnect' || true
+            fi
+        fi
+    fi
+
+    pause_screen
+}
+
+log_follow() {
+    local choice unit label
+    clear_screen
+    draw_brand
+    printf '\n%s[05-7] 实时跟踪%s\n\n' "$YELLOW" "$RESET"
+    printf '%s1.%s 限速服务\n' "$GREEN" "$RESET"
+    printf '%s2.%s 防火墙服务\n' "$GREEN" "$RESET"
+    printf '%s3.%s 全部系统日志\n' "$GREEN" "$RESET"
+    printf '%s选择 [1]:%s ' "$CYAN" "$RESET"
+    read -r choice
+
+    case "$choice" in
+        ""|1) unit="limit-ports.service"; label="限速服务" ;;
+        2) unit="portctl-firewall.service"; label="防火墙服务" ;;
+        3) unit=""; label="全部系统日志" ;;
+        *) return ;;
+    esac
+
+    if [[ "$(log_backend)" != "journald" ]]; then
+        printf '\n%s实时跟踪需要 journalctl。%s\n' "$RED" "$RESET"
+        pause_screen
+        return
+    fi
+
+    clear_screen
+    draw_brand
+    printf '\n%s实时跟踪 %s，按 Ctrl+C 返回菜单。%s\n\n' "$YELLOW" "$label" "$RESET"
+
+    # 父进程忽略 SIGINT，只有子进程被 Ctrl+C 终止，这样不会连带退出菜单。
+    trap '' INT
+    if [[ -n "$unit" ]]; then
+        ( trap - INT; run_root journalctl -u "$unit" -f -n 20 --no-pager ) || true
+    else
+        ( trap - INT; run_root journalctl -f -n 20 --no-pager ) || true
+    fi
+    trap - INT
+
+    pause_screen
+}
+
+logs_export() {
+    local lines="${1:-40}" target="${2:-/root/portctl-diag.txt}"
+    local fw_conf="${FW_CONF_FILE:-/etc/default/portctl-firewall.conf}"
+
+    [[ "$lines" =~ ^[0-9]+$ ]] || lines=40
+    lines=$((10#$lines))
+
+    {
+        printf 'portctl 诊断日志\n'
+        printf '导出时间: %s\n' "$(date '+%F %T %Z')"
+        printf '主机: %s\n' "$(hostname 2>/dev/null || printf 'unknown')"
+        printf '内核: %s\n' "$(uname -srmo 2>/dev/null || printf 'unknown')"
+        printf '系统: %s\n' \
+            "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -n 1)"
+        printf '日志来源: %s\n' "$(log_backend)"
+
+        printf '\n================ limit-ports.service ================\n'
+        journalctl -u limit-ports.service -n "$lines" --no-pager 2>&1 || true
+        printf '\n================ portctl-firewall.service ================\n'
+        journalctl -u portctl-firewall.service -n "$lines" --no-pager 2>&1 || true
+        printf '\n================ 系统错误日志 ================\n'
+        journalctl -p err -n "$lines" --no-pager 2>&1 || true
+
+        printf '\n================ tc qdisc ================\n'
+        tc -s qdisc show 2>&1 || true
+        printf '\n================ tc class ================\n'
+        tc -s class show 2>&1 || true
+
+        printf '\n================ 防火墙 ================\n'
+        fw_load
+        case "$(fw_backend)" in
+            iptables)
+                iptables -S 2>&1 || true
+                ip6tables -S 2>&1 || true
+                ;;
+            nft) nft list ruleset 2>&1 || true ;;
+            ufw) ufw status verbose 2>&1 || true ;;
+            *) printf '找不到可用的防火墙工具。\n' ;;
+        esac
+
+        printf '\n================ 端口监听 ================\n'
+        ss -tlnp 2>&1 || true
+
+        printf '\n================ 本程序配置 ================\n'
+        printf -- '--- %s ---\n' "${CONFIG_FILE:-/etc/default/limit-ports}"
+        cat "${CONFIG_FILE:-/etc/default/limit-ports}" 2>&1 || true
+        printf -- '\n--- %s ---\n' "$fw_conf"
+        cat "$fw_conf" 2>&1 || true
+
+        printf '\n================ 服务状态 ================\n'
+        systemctl --no-pager --full status limit-ports.service 2>&1 || true
+        systemctl --no-pager --full status portctl-firewall.service 2>&1 || true
+    } >"$target" 2>&1
+
+    [[ -s "$target" ]]
+}
+
+log_export_flow() {
+    local lines target answer
+    lines="$(log_prompt_lines)" || return 0
+
+    target="/root/portctl-diag-$(date +%Y%m%d-%H%M%S).txt"
+    printf '\n%s导出路径 [%s]:%s ' "$CYAN" "$target" "$RESET"
+    read -r answer
+    if [[ -n "$answer" ]]; then
+        target="$answer"
+    fi
+
+    printf '\n%s正在收集日志与运行状态...%s\n' "$DIM" "$RESET"
+    if run_root bash "$SELF_PATH" logs-export "$lines" "$target"; then
+        printf '%s已导出到 %s%s\n' "$GREEN" "$target" "$RESET"
+        printf '%s包含: 两个服务的日志、系统错误、tc 规则、防火墙规则、端口监听、配置和服务状态。%s\n' \
+            "$DIM" "$RESET"
+    else
+        printf '%s导出失败，请检查路径是否可写。%s\n' "$RED" "$RESET"
+    fi
+    pause_screen
+}
+
+log_vacuum_run() {
+    local arg="$1" label="$2" answer
+    printf '\n%s将执行: journalctl %s（%s，不可恢复）%s\n' \
+        "$YELLOW" "$arg" "$label" "$RESET"
+    printf '确认请输入 YES: '
+    read -r answer
+    if [[ "$answer" != "YES" ]]; then
+        printf '%s已取消。%s\n' "$DIM" "$RESET"
+        pause_screen
+        return
+    fi
+    run_root journalctl "$arg" 2>&1 || true
+    printf '\n%s清理完成，当前占用: %s%s\n' "$GREEN" "$(log_disk_usage)" "$RESET"
+    pause_screen
+}
+
+log_vacuum() {
+    local choice
+    clear_screen
+    draw_brand
+    printf '\n%s[05-9] 清理日志%s\n\n' "$YELLOW" "$RESET"
+
+    if [[ "$(log_backend)" != "journald" ]]; then
+        printf '%s只有 journald 才支持这里的清理功能。%s\n' "$RED" "$RESET"
+        pause_screen
+        return
+    fi
+
+    printf '%s当前占用: %s    持久化: %s%s\n' \
+        "$DIM" "$(log_disk_usage)" "$(log_persistent)" "$RESET"
+    if [[ ! -d /var/log/journal ]]; then
+        printf '%s日志目前只存在内存里，清理意义不大。可在 /etc/systemd/journald.conf 里设置 Storage=persistent 让其持久化。%s\n' \
+            "$DIM" "$RESET"
+    fi
+
+    printf '\n%s1.%s 只保留最近 7 天\n' "$GREEN" "$RESET"
+    printf '%s2.%s 只保留最近 3 天\n' "$GREEN" "$RESET"
+    printf '%s3.%s 限制总大小 200M\n' "$GREEN" "$RESET"
+    printf '%s4.%s 限制总大小 500M\n' "$GREEN" "$RESET"
+    printf '%s0.%s 取消\n\n' "$GREEN" "$RESET"
+    printf '%s选择:%s ' "$CYAN" "$RESET"
+    read -r choice
+
+    case "$choice" in
+        1) log_vacuum_run --vacuum-time=7d "保留 7 天" ;;
+        2) log_vacuum_run --vacuum-time=3d "保留 3 天" ;;
+        3) log_vacuum_run --vacuum-size=200M "限制 200M" ;;
+        4) log_vacuum_run --vacuum-size=500M "限制 500M" ;;
+        0|"") return ;;
+        *) printf '%s未知选项。%s\n' "$RED" "$RESET"; pause_screen ;;
+    esac
+}
+
+show_logs_menu() {
+    local choice lines backend
+    while true; do
+        backend="$(log_backend)"
+        clear_screen
+        draw_brand
+        printf '\n%s[05] 日志中心%s\n' "$YELLOW" "$RESET"
+        case "$backend" in
+            journald)
+                printf '%s来源:%s journald    %s持久化:%s %s    %s占用:%s %s\n' \
+                    "$DIM" "$RESET" "$DIM" "$RESET" "$(log_persistent)" \
+                    "$DIM" "$RESET" "$(log_disk_usage)"
+                ;;
+            none)
+                printf '%s来源:%s 未找到可用的日志系统\n' "$DIM" "$RESET"
+                ;;
+            *)
+                printf '%s来源:%s %s/%s\n' "$DIM" "$RESET" "$LOG_DIR" "$backend"
+                ;;
+        esac
+
+        printf '\n%s1.%s 限速服务日志\n' "$GREEN" "$RESET"
+        printf '%s2.%s 防火墙服务日志\n' "$GREEN" "$RESET"
+        printf '%s3.%s 系统错误日志\n' "$GREEN" "$RESET"
+        printf '%s4.%s 登录记录（成功 / 失败）\n' "$GREEN" "$RESET"
+        printf '%s5.%s 内核日志\n' "$GREEN" "$RESET"
+        printf '%s6.%s 全部系统日志\n' "$GREEN" "$RESET"
+        printf '%s7.%s 实时跟踪（Ctrl+C 返回）\n' "$GREEN" "$RESET"
+        printf '%s8.%s 导出诊断日志到文件\n' "$GREEN" "$RESET"
+        printf '%s9.%s 清理日志\n' "$GREEN" "$RESET"
+        printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice
+
+        case "$choice" in
+            1)
+                lines="$(log_prompt_lines)" || continue
+                log_emit "限速服务日志（limit-ports.service）" "$lines" 'limit-ports' \
+                    -u limit-ports.service
+                ;;
+            2)
+                lines="$(log_prompt_lines)" || continue
+                log_emit "防火墙服务日志（portctl-firewall.service）" "$lines" 'portctl-firewall' \
+                    -u portctl-firewall.service
+                ;;
+            3)
+                lines="$(log_prompt_lines)" || continue
+                log_emit "系统错误日志" "$lines" 'error|fail|critical|panic|denied' -p err
+                ;;
+            4) log_view_login ;;
+            5)
+                lines="$(log_prompt_lines)" || continue
+                log_emit "内核日志" "$lines" 'kernel' -k
+                ;;
+            6)
+                lines="$(log_prompt_lines)" || continue
+                log_emit "全部系统日志" "$lines" -
+                ;;
+            7) log_follow ;;
+            8) log_export_flow ;;
+            9) log_vacuum ;;
+            0|"") return ;;
+            *) printf '%s请输入 1-9 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+        esac
+    done
 }
 
 download_file() {
@@ -2188,7 +2560,7 @@ main_menu() {
             2|02) show_system_info ;;
             3|03) show_service_menu ;;
             4|04) show_firewall_menu ;;
-            5|05) show_logs ;;
+            5|05) show_logs_menu ;;
             6|06) update_script ;;
             7|07) uninstall_program ;;
             8|08) show_placeholder "[08] 网络诊断" ;;
@@ -2218,6 +2590,9 @@ case "${1:-menu}" in
         fw_load
         fw_clear_rules
         ;;
+    logs-export)
+        logs_export "${2:-40}" "${3:-/root/portctl-diag.txt}"
+        ;;
     firewall-status)
         fw_load
         printf '后端: %s\n' "$(fw_backend_label "$(fw_backend)")"
@@ -2229,7 +2604,7 @@ case "${1:-menu}" in
         fi
         ;;
     --help|-h)
-        printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status]\n' "$0"
+        printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status|logs-export <条数> <路径>]\n' "$0"
         printf 'SSH 登录服务器后直接运行即可。默认进入交互式终端菜单。\n'
         ;;
     *)
