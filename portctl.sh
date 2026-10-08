@@ -157,7 +157,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.6.4%s\n' "$CYAN" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.6.5%s\n' "$CYAN" "$RESET"
     printf '%s输入编号进入模块，0 退出，00 刷新%s\n' "$DIM" "$RESET"
 }
 
@@ -1013,6 +1013,8 @@ ACCT_SERVICE_FILE="${ACCT_SERVICE_FILE:-/etc/systemd/system/portctl-accounting.s
 ACCT_TIMER_FILE="${ACCT_TIMER_FILE:-/etc/systemd/system/portctl-accounting.timer}"
 ACCT_TIMER_NAME="portctl-accounting.timer"
 ACCT_MAX_PORTS="${ACCT_MAX_PORTS:-512}"
+# 临时的 stderr 暂存文件，只用于把诊断信息和数据分开
+ACCT_ERR_FILE="${ACCT_ERR_FILE:-${TMPDIR:-/tmp}/portctl-acct-err.$$}"
 
 acct_available() {
     command -v nft >/dev/null 2>&1
@@ -1090,6 +1092,14 @@ acct_setup() {
     fi
     n="$(acct_ports | wc -l)"
 
+    # 先用 -c（check）让 nft 只解析不执行：语法/内核校验不过就直接放弃，
+    # 已经存在的旧统计表原封不动，不会出现"删了旧表又装不上新表"。
+    if ! nft -c -f "$script" 2>&1; then
+        rm -f "$script"
+        printf 'nft 校验未通过（上面是内核报错），未做任何修改。\n' >&2
+        return 1
+    fi
+
     nft delete table inet "$ACCT_TABLE" 2>/dev/null || true
     if ! nft -f "$script"; then
         rm -f "$script"
@@ -1097,6 +1107,12 @@ acct_setup() {
         return 1
     fi
     rm -f "$script"
+
+    if ! acct_table_exists; then
+        printf 'nft 报告成功但表不存在，未建立统计。\n' >&2
+        return 1
+    fi
+
     printf '统计规则已建立: %s 个端口 × 2 个方向。\n' "$n"
     return 0
 }
@@ -1112,15 +1128,38 @@ acct_remove() {
 
 # 输出: port<TAB>up<TAB>down
 # $1 = reset（读取并清零，用于折叠）| 省略（只读）
+#
+# reset 会把内核计数器清零，所以只有在确认拿到了**完整**列表时才允许折叠：
+# 任何一次 nft 调用失败或输出异常，都必须放弃本次折叠而不是把残缺数据当真。
 acct_read_counters() {
-    local mode="${1:-read}" out
+    local mode="${1:-read}" out rc=0 expected seen
+
     if [[ "$mode" == "reset" ]]; then
-        out="$(nft reset counters table inet "$ACCT_TABLE" 2>/dev/null || true)"
+        out="$(nft reset counters table inet "$ACCT_TABLE" 2>&1)" || rc=$?
     else
-        out="$(nft list counters table inet "$ACCT_TABLE" 2>/dev/null || true)"
+        out="$(nft list counters table inet "$ACCT_TABLE" 2>&1)" || rc=$?
+    fi
+
+    if (( rc != 0 )); then
+        printf '[acct] nft 执行失败（退出码 %s）: %s\n' "$rc" "$out" >&2
+        return 1
     fi
     if [[ -z "$out" ]]; then
-        return 0
+        printf '[acct] nft 没有输出，放弃本次读取。\n' >&2
+        return 1
+    fi
+
+    # 该有的计数器一个都不能少，少一个就意味着有字节会被漏掉。
+    expected="$(acct_ports 2>/dev/null | wc -l)" || expected=0
+    seen="$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*counter (up|down)_[0-9]+' || true)"
+    if (( expected > 0 )) && (( seen != expected * 2 )); then
+        printf '[acct] 只读到 %s/%s 个计数器，放弃本次读取。\n' \
+            "$seen" "$((expected * 2))" >&2
+        if (( seen > 0 )); then
+            printf '[acct] 端口规则和已建立的统计表不一致（改过端口规则？），\n' >&2
+            printf '[acct] 请在 [01]→10 里选「2. 按当前端口规则建立 / 重建统计」。\n' >&2
+        fi
+        return 1
     fi
 
     printf '%s\n' "$out" | awk '
@@ -1169,7 +1208,12 @@ acct_sample() {
     fi
 
     local live
-    live="$(acct_read_counters reset)"
+    if ! live="$(acct_read_counters reset)"; then
+        # 读取不完整时绝不能折叠：reset 可能已经清零，但我们手里的数据是残的。
+        # 直接失败退出，让 systemd 记录一次失败的采样，而不是悄悄丢掉流量。
+        printf '[acct] 本次采样放弃，未写入累计文件。\n' >&2
+        return 1
+    fi
     if [[ -z "$live" ]]; then
         return 0
     fi
@@ -1312,9 +1356,20 @@ show_traffic_accounting() {
             return
         fi
 
-        data="$(run_root bash "$SELF_PATH" acct-show 2>&1)"
-        rows="$(printf '%s\n' "$data" | grep -v '^#TOTAL' || true)"
+        # stdout 是数据、stderr 是诊断信息，必须分开：
+        # 合并到一起的话，一条 [acct] 警告会被当成数据行混进表格。
+        local err_file="$ACCT_ERR_FILE"
+        : >"$err_file" 2>/dev/null || err_file=/dev/null
+        data="$(run_root bash "$SELF_PATH" acct-show 2>"$err_file")"
+        local acct_err=""
+        [[ -s "$err_file" ]] && acct_err="$(cat "$err_file")"
+
+        rows="$(printf '%s\n' "$data" | grep '^[0-9]' || true)"
         total_line="$(printf '%s\n' "$data" | grep '^#TOTAL' || true)"
+
+        if [[ -n "$acct_err" ]]; then
+            printf '\n%s读取累计数据时有问题:%s\n%s\n' "$YELLOW" "$RESET" "$acct_err"
+        fi
 
         local n_rows n_active
         n_rows="$(printf '%s\n' "$rows" | grep -c '^[0-9]' || true)"
@@ -3229,8 +3284,8 @@ uninstall_program() {
     draw_brand
     printf '\n%s[07] 卸载程序%s\n\n' "$YELLOW" "$RESET"
     printf '%s这将停止服务并删除 zc、portctl.sh 和 limit_ports.sh。%s\n' "$RED" "$RESET"
-    printf '%s同时会移除 portctl-firewall.service（不会主动撤销已下发的防火墙规则）。%s\n' "$DIM" "$RESET"
-    printf '%s默认保留 /etc/default/limit-ports 配置。%s\n\n' "$DIM" "$RESET"
+    printf '%s同时会移除 portctl-firewall.service 与流量统计定时器（不会主动撤销已下发的防火墙规则）。%s\n' "$DIM" "$RESET"
+    printf '%s默认保留 /etc/default/limit-ports 配置与流量统计累积数据。%s\n\n' "$DIM" "$RESET"
     printf '确认卸载请输入 %sYES%s，其他输入取消: ' "$RED" "$RESET"
     read -r confirmation
     [[ "$confirmation" == "YES" ]] || {
@@ -3246,7 +3301,13 @@ uninstall_program() {
         run_root rm -f /etc/systemd/system/limit-ports.service
         run_root systemctl disable --now "$FW_UNIT_NAME" 2>/dev/null || true
         run_root rm -f "$FW_UNIT_FILE"
+        run_root systemctl disable --now "$ACCT_TIMER_NAME" 2>/dev/null || true
+        run_root rm -f "$ACCT_TIMER_FILE" "$ACCT_SERVICE_FILE"
         run_root systemctl daemon-reload 2>/dev/null || true
+    fi
+    # 统计表由本程序创建，卸载时一并撤掉；累计数据文件保留，除非用户选择删配置。
+    if acct_available && acct_table_exists; then
+        run_root nft delete table inet "$ACCT_TABLE" 2>/dev/null || true
     fi
     run_root rm -f /usr/local/bin/zc
     run_root rm -f /usr/local/sbin/portctl.sh
@@ -3254,6 +3315,7 @@ uninstall_program() {
     if [[ "${remove_config,,}" == "y" || "${remove_config,,}" == "yes" ]]; then
         run_root rm -f /etc/default/limit-ports
         run_root rm -f "$FW_CONF_FILE"
+        run_root rm -f "$ACCT_FILE"
     fi
     printf '%s卸载完成。%s\n' "$GREEN" "$RESET"
     printf '%s当前菜单进程将在返回后退出。%s\n' "$DIM" "$RESET"
@@ -3318,9 +3380,12 @@ case "${1:-menu}" in
         conntrack_by_port
         ;;
     acct-setup)
+        load_rules || true
         acct_setup
         ;;
     acct-sample)
+        # 采样要用 RULE_* 判断"该有几个计数器"，缺了它完整性校验形同虚设。
+        load_rules || true
         acct_sample
         ;;
     acct-show)
