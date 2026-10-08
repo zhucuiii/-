@@ -70,7 +70,7 @@ clear_screen() {
 
 pause_screen() {
     printf '\n%s按 Enter 返回...%s' "$DIM" "$RESET"
-    read -r
+    read -r || return 0
 }
 
 run_root() {
@@ -157,27 +157,25 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.6.5%s\n' "$CYAN" "$RESET"
-    printf '%s输入编号进入模块，0 退出，00 刷新%s\n' "$DIM" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.7.0%s\n' "$DIM" "$RESET"
 }
 
 draw_status() {
     local host
     host="$(hostname 2>/dev/null || printf 'unknown')"
-    printf '\n%s主机:%s %-24s %s网卡:%s %-10s %s默认速率:%s %s\n' \
-        "$DIM" "$RESET" "$host" "$DIM" "$RESET" "$NIC" "$DIM" "$RESET" \
-        "$(current_rate_mb "$SPEED")"
+    printf '\n%s主机:%s %s\n' "$DIM" "$RESET" "$host"
+    printf '%s网卡:%s %s    %s默认速率:%s %s (%s)\n' \
+        "$DIM" "$RESET" "$NIC" "$DIM" "$RESET" "$SPEED" "$(current_rate_mb "$SPEED")"
 }
 
 draw_menu() {
     printf '\n%s----------------------------------------%s\n' "$BLUE" "$RESET"
     printf '%s01.%s  %s端口限速%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s02.%s  %s系统信息%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s03.%s  %s服务管理%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s04.%s  %s防火墙规则%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s02.%s  %s流量查看%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s03.%s  %s防火墙规则%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s04.%s  %s限速服务%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s05.%s  %s日志中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s06.%s  %s更新脚本%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s07.%s  %s卸载程序%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s06.%s  %s系统与维护%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s----------------------------------------%s\n' "$BLUE" "$RESET"
     printf '%s00.%s  %s刷新状态%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s0.%s   %s退出控制台%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
@@ -269,30 +267,13 @@ rule_to_spec() {
     printf '%s' "$spec"
 }
 
-prompt_port() {
-    local prompt="$1" value
-    while true; do
-        printf '%s%s%s ' "$CYAN" "$prompt" "$RESET" >&2
-        read -r value || return 1
-        if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-            printf '%s请输入数字端口。%s\n' "$RED" "$RESET" >&2
-            continue
-        fi
-        if (( value < 1 || value > 65535 )); then
-            printf '%s端口必须在 1-65535 之间。%s\n' "$RED" "$RESET" >&2
-            continue
-        fi
-        printf '%s' "$value"
-        return 0
-    done
-}
-
 prompt_rate() {
     local label="$1" value unit new_rate
     while true; do
-        printf '%s输入%s速率数值（只输入数字，例如 8、12、20）:%s ' \
+        printf '%s输入%s速率数值（只输入数字，回车取消）:%s ' \
             "$CYAN" "$label" "$RESET" >&2
         read -r value || return 1
+        [[ -n "$value" ]] || return 1
         if [[ "$value" =~ ^([0-9]+([.][0-9]+)?)$ ]] &&
             awk "BEGIN { exit !($value > 0) }"; then
             break
@@ -384,49 +365,44 @@ config_apply_edits() {
 apply_after_change() {
     local answer
     printf '\n%s现在立即应用新规则？[Y/n]:%s ' "$CYAN" "$RESET"
-    read -r answer
+    read -r answer || return 0
     if [[ -z "$answer" || "${answer,,}" == "y" || "${answer,,}" == "yes" ]]; then
         printf '\n'
         limit_root apply || true
     else
-        printf '%s已保存到配置，之后可在菜单里选择「1. 立即应用当前配置」。%s\n' \
+        printf '%s已保存到配置，之后可在「端口限速 > 应用当前配置」生效。%s\n' \
             "$DIM" "$RESET"
     fi
     pause_screen
 }
 
-# 2/3: add a range or a single port, replacing overlapping rules.
+prompt_port_range() {
+    local value start end
+    while true; do
+        printf '%s端口或区间（8080 / 10001-10200，回车取消）:%s ' "$CYAN" "$RESET" >&2
+        read -r value || return 1
+        [[ -n "$value" ]] || return 1
+        if [[ "$value" =~ ^([0-9]{1,5})(-([0-9]{1,5}))?$ ]]; then
+            start=$((10#${BASH_REMATCH[1]}))
+            end=$((10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}))
+            if (( start >= 1 && end <= 65535 && end >= start )); then
+                printf '%s\t%s' "$start" "$end"
+                return 0
+            fi
+        fi
+        printf '%s请输入 1-65535 内的端口或递增区间。%s\n' "$RED" "$RESET" >&2
+    done
+}
+
+# One entry point accepts both a single port and a range.
 add_rule_flow() {
-    local kind="$1"
-    local start end rate mode mode_choice answer
+    local start end rate mode mode_choice ports
 
     clear_screen
     draw_brand
-    if [[ "$kind" == "single" ]]; then
-        printf '\n%s[01-3] 单端口限速%s\n\n' "$YELLOW" "$RESET"
-    else
-        printf '\n%s[01-2] 区间限速%s\n\n' "$YELLOW" "$RESET"
-    fi
-
-    start="$(prompt_port '起始端口:')" || {
-        pause_screen
-        return
-    }
-
-    if [[ "$kind" == "single" ]]; then
-        end="$start"
-    else
-        while true; do
-            end="$(prompt_port '结束端口:')" || {
-                pause_screen
-                return
-            }
-            if (( end >= start )); then
-                break
-            fi
-            printf '%s结束端口不能小于起始端口 %s。%s\n' "$RED" "$start" "$RESET"
-        done
-    fi
+    printf '\n%s端口限速 > 添加限速规则%s\n\n' "$YELLOW" "$RESET"
+    ports="$(prompt_port_range)" || return 0
+    IFS=$'\t' read -r start end <<<"$ports"
 
     rate="$(prompt_rate '限速')" || {
         pause_screen
@@ -434,14 +410,14 @@ add_rule_flow() {
     }
 
     mode="per-port"
-    if [[ "$kind" == "range" ]]; then
+    if (( end > start )); then
         printf '\n%s请选择限速方式:%s\n' "$CYAN" "$RESET"
         printf '%s1.%s 每端口独立：区间内每个端口各自 %s\n' \
             "$GREEN" "$RESET" "$rate"
         printf '%s2.%s 区间共享：%s-%s 合计 %s\n' \
             "$GREEN" "$RESET" "$start" "$end" "$rate"
         printf '%s选择 [1]:%s ' "$CYAN" "$RESET"
-        read -r mode_choice
+        read -r mode_choice || return 0
         case "$mode_choice" in
             ""|1) mode="per-port" ;;
             2) mode="shared" ;;
@@ -490,7 +466,7 @@ commit_new_rule() {
             print_rule_by_index "$c" || true
         done
         printf '\n%s确认替换？[y/N]:%s ' "$YELLOW" "$RESET"
-        read -r answer
+        read -r answer || return 0
         if [[ "${answer,,}" != "y" && "${answer,,}" != "yes" ]]; then
             printf '%s已取消。%s\n' "$DIM" "$RESET"
             pause_screen
@@ -532,13 +508,76 @@ commit_new_rule() {
     fi
 }
 
-# 4: rewrite every rule with one rate.
+change_rule_rate() {
+    local answer i selected=-1 rate spec="" piece
+    clear_screen
+    draw_brand
+    printf '\n%s端口限速 > 修改单条规则速率%s\n\n' "$YELLOW" "$RESET"
+    if ! load_rules; then
+        printf '%s读取规则失败: %s%s\n' "$RED" "$RULES_ERROR" "$RESET"
+        pause_screen
+        return
+    fi
+    print_rules_table
+    ((${#RULE_IDX[@]})) || { pause_screen; return; }
+    printf '\n%s规则编号（回车取消）:%s ' "$CYAN" "$RESET"
+    read -r answer || return 0
+    [[ -n "$answer" ]] || return 0
+    for ((i = 0; i < ${#RULE_IDX[@]}; i++)); do
+        if [[ "${RULE_IDX[i]}" == "$answer" ]]; then
+            selected="$i"
+            break
+        fi
+    done
+    if (( selected < 0 )); then
+        printf '%s规则编号无效。%s\n' "$RED" "$RESET"
+        pause_screen
+        return
+    fi
+    rate="$(prompt_rate '新')" || { pause_screen; return; }
+    for ((i = 0; i < ${#RULE_IDX[@]}; i++)); do
+        if (( i == selected )); then
+            piece="$(rule_to_spec "$i" "$rate")"
+        else
+            piece="$(rule_to_spec "$i")"
+        fi
+        spec+="${spec:+ }$piece"
+    done
+    if config_apply_edits "PORT_SPEC=$spec"; then
+        printf '%s已保存规则 %s 的新速率: %s%s\n' "$GREEN" "$answer" "$rate" "$RESET"
+        apply_after_change
+    else
+        pause_screen
+    fi
+}
+
+show_rule_edit_menu() {
+    local choice
+    while true; do
+        clear_screen
+        draw_brand
+        printf '\n%s端口限速 > 修改规则速率%s\n\n' "$YELLOW" "$RESET"
+        printf '%s1.%s 修改单条规则速率\n' "$GREEN" "$RESET"
+        printf '%s2.%s 统一修改全部规则速率\n' "$GREEN" "$RESET"
+        printf '%s0.%s 返回端口限速\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice || return 0
+        case "$choice" in
+            1) change_rule_rate ;;
+            2) change_all_rates ;;
+            0|"") return ;;
+            *) printf '%s请输入 1-2 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+        esac
+    done
+}
+
+# Rewrite every rule with one rate.
 change_all_rates() {
     local i rate spec piece
 
     clear_screen
     draw_brand
-    printf '\n%s[01-4] 统一修改全部规则速率%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s端口限速 > 统一修改全部规则速率%s\n\n' "$YELLOW" "$RESET"
 
     if ! load_rules; then
         printf '%s读取规则失败:%s\n%s\n' "$RED" "$RESET" "$RULES_ERROR"
@@ -577,13 +616,13 @@ change_all_rates() {
     fi
 }
 
-# 5: delete selected rules.
+# Delete selected rules.
 delete_rules() {
     local answer token found i skip spec
 
     clear_screen
     draw_brand
-    printf '\n%s[01-5] 删除限速规则%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s端口限速 > 删除限速规则%s\n\n' "$YELLOW" "$RESET"
 
     if ! load_rules; then
         printf '%s读取规则失败:%s\n%s\n' "$RED" "$RESET" "$RULES_ERROR"
@@ -598,7 +637,7 @@ delete_rules() {
 
     printf '\n%s输入要删除的规则编号（多个用空格分隔，直接回车取消）:%s ' \
         "$CYAN" "$RESET"
-    read -r answer
+    read -r answer || return 0
     if [[ -z "$answer" ]]; then
         pause_screen
         return
@@ -654,13 +693,13 @@ delete_rules() {
     fi
 }
 
-# 6: remove every rule.
+# Remove every rule, with explicit confirmation.
 clear_rules() {
     local answer
 
     clear_screen
     draw_brand
-    printf '\n%s[01-6] 清空全部限速规则%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s端口限速 > 高级与排障 > 清空全部规则%s\n\n' "$YELLOW" "$RESET"
 
     if ! load_rules; then
         printf '%s读取规则失败:%s\n%s\n' "$RED" "$RESET" "$RULES_ERROR"
@@ -672,7 +711,7 @@ clear_rules() {
     printf '\n%s这会删除配置里的全部端口规则，应用后只剩默认队列。%s\n' \
         "$RED" "$RESET"
     printf '确认清空请输入 %sYES%s，其他输入取消: ' "$RED" "$RESET"
-    read -r answer
+    read -r answer || return 0
     if [[ "$answer" != "YES" ]]; then
         printf '%s已取消。%s\n' "$DIM" "$RESET"
         pause_screen
@@ -714,8 +753,7 @@ show_port_stats() {
 
     clear_screen
     draw_brand
-    printf '\n%s[01-8] 端口实时流量%s\n' "$YELLOW" "$RESET"
-    printf '%s一个端口对应用户，速率取两次采样之间的平均值。%s\n\n' "$DIM" "$RESET"
+    printf '\n%s流量查看 > 限速端口实时流量%s\n\n' "$YELLOW" "$RESET"
 
     if ! sample_a="$(limit_local stats 2>&1)"; then
         printf '%s读取失败:%s\n%s\n' "$RED" "$RESET" "$sample_a"
@@ -726,7 +764,7 @@ show_port_stats() {
     n="$(printf '%s\n' "$sample_a" | grep -c '^[0-9]' || true)"
     if [[ "${n:-0}" == "0" ]]; then
         printf '%s没有读到任何限速队列。%s\n' "$YELLOW" "$RESET"
-        printf '%s可能还没点「1. 立即应用当前配置」，或者规则是空的。%s\n' "$DIM" "$RESET"
+        printf '%s请先在「端口限速」添加规则并应用当前配置。%s\n' "$DIM" "$RESET"
         pause_screen
         return
     fi
@@ -765,7 +803,7 @@ show_port_stats() {
     head="  $(pad '端口' 16) $(pad '限速' 10) $(pad '当前速率' 12) $(pad '累计流量' 13) 包数"
     printf '\n%s%s%s\n' "$DIM" "$head" "$RESET"
 
-    printf '%s' "$rows" | sort -rn -k1,1 | head -n 25 |
+    printf '%s' "$rows" | sort -rn -k1,1 | sed -n '1,25p' |
         while IFS=$'\t' read -r _delta port rate speed human pkts; do
             if [[ -n "$port" ]]; then
                 row="  $(pad "$port" 16) $(pad "$rate" 10) $(pad "$speed" 12) $(pad "$human" 13) $pkts"
@@ -916,7 +954,7 @@ draw_traffic_screen() {
     # 不整屏清，避免闪烁
     printf '%s[H' "$ESC"
     draw_brand
-    printf '\n%s[01-9] 全部端口实时流量%s   %s%s%s   %s每 %s 秒刷新，Ctrl+C 返回%s\n' \
+    printf '\n%s流量查看 > 全部端口实时流量%s   %s%s%s   %s每 %s 秒刷新，Ctrl+C 返回%s\n' \
         "$YELLOW" "$RESET" "$DIM" "$(date '+%H:%M:%S')" "$RESET" \
         "$DIM" "$interval" "$RESET"
 
@@ -930,7 +968,7 @@ draw_traffic_screen() {
     head="  $(pad '端口' 12) $(pad '协议' 8) $(pad '当前速率' 14) $(pad '连接数' 10) 限速"
     printf '\n%s%s%s\n' "$DIM" "$head" "$RESET"
 
-    printf '%s' "$rows" | sort -rn -k1,1 | head -n "$TRAFFIC_TOP" |
+    printf '%s' "$rows" | sort -rn -k1,1 | sed -n "1,${TRAFFIC_TOP}p" |
         while IFS=$'\t' read -r _delta port proto speed conns limited; do
             if [[ -n "$port" ]]; then
                 row="  $(pad "$port" 12) $(pad "$proto" 8) $(pad "$speed" 14) $(pad "$conns" 10) $limited"
@@ -1164,7 +1202,7 @@ acct_read_counters() {
             "$seen" "$((expected * 2))" >&2
         if (( seen > 0 )); then
             printf '[acct] 端口规则和已建立的统计表不一致（改过端口规则？），\n' >&2
-            printf '[acct] 请在 [01]→10 里选「2. 按当前端口规则建立 / 重建统计」。\n' >&2
+            printf '[acct] 请在「流量查看 > 上行 / 下行累计」里选「2. 建立 / 重建统计」。\n' >&2
         fi
         return 1
     fi
@@ -1360,7 +1398,7 @@ show_traffic_accounting() {
     while true; do
         clear_screen
         draw_brand
-        printf '\n%s[01-10] 流量统计（每端口上行 / 下行）%s\n' "$YELLOW" "$RESET"
+        printf '\n%s流量查看 > 上行 / 下行累计%s\n' "$YELLOW" "$RESET"
 
         if ! acct_available; then
             printf '\n%s找不到 nft 命令，这个功能需要 nftables。%s\n' "$RED" "$RESET"
@@ -1401,7 +1439,7 @@ show_traffic_accounting() {
             local head row
             head="  $(pad '端口' 10) $(pad '上行（用户上传）' 18) $(pad '下行（用户下载）' 18) $(pad '合计' 12) 限速"
             printf '\n%s%s%s\n' "$DIM" "$head" "$RESET"
-            printf '%s\n' "$rows" | awk -F'\t' '$1 > 0' | sort -rn -k1,1 | head -n 30 |
+            printf '%s\n' "$rows" | awk -F'\t' '$1 > 0' | sort -rn -k1,1 | sed -n '1,30p' |
                 while IFS=$'\t' read -r _t port u d rate; do
                     [[ -n "$port" ]] || continue
                     row="  $(pad "$port" 10) $(pad "$(human_bytes "$u")" 18) $(pad "$(human_bytes "$d")" 18) $(pad "$(human_bytes "$((u + d))")" 12) $rate"
@@ -1436,7 +1474,7 @@ show_traffic_accounting() {
         printf '%s5.%s 移除统计规则（保留磁盘数据）\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
-        read -r choice
+        read -r choice || return 0
 
         case "$choice" in
             ""|1) continue ;;
@@ -1447,7 +1485,7 @@ show_traffic_accounting() {
                 ;;
             3)
                 printf '\n%s这会清空所有端口的累计流量，不可恢复。确认请输入 YES: %s' "$YELLOW" "$RESET"
-                read -r choice
+                read -r choice || return 0
                 if [[ "$choice" == "YES" ]]; then
                     run_root bash "$SELF_PATH" acct-reset || true
                 else
@@ -1482,6 +1520,54 @@ show_traffic_accounting() {
     done
 }
 
+show_traffic_menu() {
+    local choice
+    while true; do
+        clear_screen
+        draw_brand
+        printf '\n%s[02] 流量查看%s\n\n' "$YELLOW" "$RESET"
+        printf '%s1.%s 限速端口实时流量\n' "$GREEN" "$RESET"
+        printf '%s2.%s 上行 / 下行累计\n' "$GREEN" "$RESET"
+        printf '%s3.%s 全部端口监控（排障）\n' "$GREEN" "$RESET"
+        printf '%s0.%s 返回\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice || return 0
+        case "$choice" in
+            1) show_port_stats ;;
+            2) show_traffic_accounting ;;
+            3) show_all_port_traffic ;;
+            0|"") return ;;
+            *) printf '%s请输入 1-3 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+        esac
+    done
+}
+
+show_limit_advanced_menu() {
+    local choice
+    while true; do
+        clear_screen
+        draw_brand
+        printf '\n%s端口限速 > 高级与排障%s\n\n' "$YELLOW" "$RESET"
+        printf '%s1.%s 查看 tc 队列与统计\n' "$GREEN" "$RESET"
+        printf '%s2.%s 查看配置执行计划\n' "$GREEN" "$RESET"
+        printf '%s3.%s 清空全部限速规则\n' "$RED" "$RESET"
+        printf '%s0.%s 返回端口限速\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice || return 0
+        case "$choice" in
+            1)
+                run_root tc -s qdisc show dev "$NIC" || true
+                run_root tc -s class show dev "$NIC" || true
+                pause_screen
+                ;;
+            2) limit_local plan -v || true; pause_screen ;;
+            3) clear_rules ;;
+            0|"") return ;;
+            *) printf '%s请输入 1-3 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+        esac
+    done
+}
+
 show_limit_menu() {
     local choice
 
@@ -1500,44 +1586,29 @@ show_limit_menu() {
             printf '%s  读取规则失败: %s%s\n' "$RED" "$RULES_ERROR" "$RESET"
         fi
 
-        printf '\n%s1.%s 立即应用当前配置\n' "$GREEN" "$RESET"
-        printf '%s2.%s 区间限速（批量端口）\n' "$GREEN" "$RESET"
-        printf '%s3.%s 单端口限速\n' "$GREEN" "$RESET"
-        printf '%s4.%s 统一修改全部规则速率\n' "$GREEN" "$RESET"
-        printf '%s5.%s 删除限速规则\n' "$GREEN" "$RESET"
-        printf '%s6.%s 清空全部规则\n' "$GREEN" "$RESET"
-        printf '%s7.%s 查看 tc 规则统计\n' "$GREEN" "$RESET"
-        printf '%s8.%s 端口实时流量（每端口=每用户）\n' "$GREEN" "$RESET"
-        printf '%s9.%s 全部端口流量监控（实时刷新）\n' "$GREEN" "$RESET"
-        printf '%s10.%s 流量统计（每端口上行/下行累计）\n' "$GREEN" "$RESET"
+        printf '\n%s1.%s 添加限速规则\n' "$GREEN" "$RESET"
+        printf '%s2.%s 修改规则速率\n' "$GREEN" "$RESET"
+        printf '%s3.%s 删除限速规则\n' "$GREEN" "$RESET"
+        printf '%s4.%s 应用当前配置\n' "$GREEN" "$RESET"
+        printf '%s5.%s 流量查看\n' "$GREEN" "$RESET"
+        printf '%s6.%s 高级与排障\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
-        read -r choice
+        read -r choice || return 0
 
         case "$choice" in
-            1)
+            1) add_rule_flow ;;
+            2) show_rule_edit_menu ;;
+            3) delete_rules ;;
+            4)
                 limit_root apply || true
                 pause_screen
                 ;;
-            2) add_rule_flow range ;;
-            3) add_rule_flow single ;;
-            4) change_all_rates ;;
-            5) delete_rules ;;
-            6) clear_rules ;;
-            7)
-                run_root tc -s qdisc show dev "$NIC" || true
-                run_root tc -s class show dev "$NIC" || true
-                pause_screen
-                ;;
-            8) show_port_stats
-                ;;
-            9) show_all_port_traffic
-                ;;
-            10) show_traffic_accounting
-                ;;
+            5) show_traffic_menu ;;
+            6) show_limit_advanced_menu ;;
             0|"") return ;;
             *)
-                printf '%s请输入 1-10 或 0。%s\n' "$RED" "$RESET"
+                printf '%s请输入 1-6 或 0。%s\n' "$RED" "$RESET"
                 pause_screen
                 ;;
         esac
@@ -1824,7 +1895,7 @@ fw_save() {
     }
 
     {
-        printf '# portctl 防火墙规则（由控制台 [04] 菜单维护）\n'
+        printf '# portctl 防火墙规则（由控制台防火墙菜单维护）\n'
         printf '# 语法: <allow|deny> <tcp|udp|all> <端口|起始-结束|all> [from <IP|CIDR>]\n'
         printf '# 规则按顺序匹配，第一条命中生效；只影响新建连接。\n'
         printf 'backend %s\n' "$FW_BACKEND_CFG"
@@ -2517,7 +2588,7 @@ fw_apply_after_change() {
         printf '\n'
         fw_apply_from_menu
     else
-        printf '%s已保存配置，之后可在菜单里选择「1. 立即应用当前配置」。%s\n' \
+        printf '%s已保存配置，之后可在「防火墙规则 > 应用当前配置」生效。%s\n' \
             "$DIM" "$RESET"
         pause_screen
     fi
@@ -2528,7 +2599,7 @@ fw_add_port_flow() {
 
     clear_screen
     draw_brand
-    printf '\n%s[04-2] 添加端口规则%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s防火墙规则 > 添加端口规则%s\n\n' "$YELLOW" "$RESET"
 
     action="$(fw_prompt_action)" || {
         pause_screen
@@ -2569,7 +2640,7 @@ fw_add_ip_flow() {
 
     clear_screen
     draw_brand
-    printf '\n%s[04-3] 添加来源 IP 规则%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s防火墙规则 > 添加来源 IP 规则%s\n\n' "$YELLOW" "$RESET"
 
     action="$(fw_prompt_action)" || {
         pause_screen
@@ -2608,7 +2679,7 @@ fw_delete_flow() {
 
     clear_screen
     draw_brand
-    printf '\n%s[04-4] 删除规则%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s防火墙规则 > 删除规则%s\n\n' "$YELLOW" "$RESET"
 
     fw_load
     fw_render_table
@@ -2676,11 +2747,11 @@ fw_clear_flow() {
     local answer
     clear_screen
     draw_brand
-    printf '\n%s[04-5] 清空全部规则%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s防火墙规则 > 高级与排障 > 清空全部规则%s\n\n' "$YELLOW" "$RESET"
 
     fw_load
     fw_render_table
-    printf '\n%s清空后不会立刻撤销系统里的规则，需要再选「1. 立即应用当前配置」才会移除链/表。%s\n' \
+    printf '\n%s清空后不会立刻撤销系统里的规则，需要再选「应用当前配置」才会移除链/表。%s\n' \
         "$DIM" "$RESET"
     printf '确认清空请输入 %sYES%s，其他输入取消: ' "$RED" "$RESET"
     read -r answer
@@ -2706,7 +2777,7 @@ fw_clear_flow() {
 fw_show_system_rules() {
     clear_screen
     draw_brand
-    printf '\n%s[04-6] 系统实际规则%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s防火墙规则 > 系统实际规则%s\n\n' "$YELLOW" "$RESET"
 
     case "$(fw_backend)" in
         iptables)
@@ -2741,7 +2812,7 @@ fw_settings_menu() {
     local choice
     clear_screen
     draw_brand
-    printf '\n%s[04-7] 后端与开机自启%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s防火墙规则 > 后端与开机自启%s\n\n' "$YELLOW" "$RESET"
     printf '%s自动探测结果:%s %s\n' "$DIM" "$RESET" "$(fw_backend_label "$(fw_detect_backend)")"
     printf '%s当前设置:%s %s → %s\n' \
         "$DIM" "$RESET" "$FW_BACKEND_CFG" "$(fw_backend_label "$(fw_backend)")"
@@ -2755,7 +2826,7 @@ fw_settings_menu() {
     printf '%s6.%s 关闭并删除开机自启单元\n' "$GREEN" "$RESET"
     printf '%s0.%s 返回\n\n' "$GREEN" "$RESET"
     printf '%s选择:%s ' "$CYAN" "$RESET"
-    read -r choice
+    read -r choice || return 0
 
     case "$choice" in
         1|2|3|4)
@@ -2788,13 +2859,54 @@ fw_settings_menu() {
     esac
 }
 
+fw_add_menu() {
+    local choice
+    clear_screen
+    draw_brand
+    printf '\n%s防火墙规则 > 添加规则%s\n\n' "$YELLOW" "$RESET"
+    printf '%s1.%s 端口规则（放行 / 封禁）\n' "$GREEN" "$RESET"
+    printf '%s2.%s 来源 IP 规则（放行 / 封禁）\n' "$GREEN" "$RESET"
+    printf '%s0.%s 返回防火墙规则\n' "$GREEN" "$RESET"
+    printf '\n%s选择:%s ' "$CYAN" "$RESET"
+    read -r choice || return 0
+    case "$choice" in
+        1) fw_add_port_flow ;;
+        2) fw_add_ip_flow ;;
+        0|"") return ;;
+        *) printf '%s请输入 1-2 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+    esac
+}
+
+show_firewall_advanced_menu() {
+    local choice
+    while true; do
+        fw_load
+        clear_screen
+        draw_brand
+        printf '\n%s防火墙规则 > 高级与排障%s\n\n' "$YELLOW" "$RESET"
+        printf '%s1.%s 查看系统实际规则\n' "$GREEN" "$RESET"
+        printf '%s2.%s 后端与开机自启设置\n' "$GREEN" "$RESET"
+        printf '%s3.%s 清空全部防火墙规则\n' "$RED" "$RESET"
+        printf '%s0.%s 返回防火墙规则\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice || return 0
+        case "$choice" in
+            1) fw_show_system_rules ;;
+            2) fw_settings_menu ;;
+            3) fw_clear_flow ;;
+            0|"") return ;;
+            *) printf '%s请输入 1-3 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+        esac
+    done
+}
+
 show_firewall_menu() {
     local choice ip
     while true; do
         fw_load
         clear_screen
         draw_brand
-        printf '\n%s[04] 防火墙规则%s\n' "$YELLOW" "$RESET"
+        printf '\n%s[03] 防火墙规则%s\n' "$YELLOW" "$RESET"
         printf '%s后端:%s %s    %s开机自启:%s %s\n' \
             "$DIM" "$RESET" "$(fw_backend_label "$(fw_backend)")" \
             "$DIM" "$RESET" "$(fw_autostart_label)"
@@ -2811,28 +2923,22 @@ show_firewall_menu() {
             printf '\n%s配置文件里有被忽略的行:%s\n%s' "$YELLOW" "$RESET" "$FW_NOTES"
         fi
 
-        printf '\n%s1.%s 立即应用当前配置\n' "$GREEN" "$RESET"
-        printf '%s2.%s 添加端口规则（放行 / 封禁）\n' "$GREEN" "$RESET"
-        printf '%s3.%s 添加来源 IP 规则（放行 / 封禁）\n' "$GREEN" "$RESET"
-        printf '%s4.%s 删除规则\n' "$GREEN" "$RESET"
-        printf '%s5.%s 清空全部规则\n' "$GREEN" "$RESET"
-        printf '%s6.%s 查看系统实际规则\n' "$GREEN" "$RESET"
-        printf '%s7.%s 后端与开机自启设置\n' "$GREEN" "$RESET"
+        printf '\n%s1.%s 添加防火墙规则\n' "$GREEN" "$RESET"
+        printf '%s2.%s 删除防火墙规则\n' "$GREEN" "$RESET"
+        printf '%s3.%s 应用当前配置\n' "$GREEN" "$RESET"
+        printf '%s4.%s 高级与排障\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
-        read -r choice
+        read -r choice || return 0
 
         case "$choice" in
-            1) fw_apply_from_menu ;;
-            2) fw_add_port_flow ;;
-            3) fw_add_ip_flow ;;
-            4) fw_delete_flow ;;
-            5) fw_clear_flow ;;
-            6) fw_show_system_rules ;;
-            7) fw_settings_menu ;;
+            1) fw_add_menu ;;
+            2) fw_delete_flow ;;
+            3) fw_apply_from_menu ;;
+            4) show_firewall_advanced_menu ;;
             0|"") return ;;
             *)
-                printf '%s请输入 1-7 或 0。%s\n' "$RED" "$RESET"
+                printf '%s请输入 1-4 或 0。%s\n' "$RED" "$RESET"
                 pause_screen
                 ;;
         esac
@@ -2842,7 +2948,7 @@ show_firewall_menu() {
 show_system_info() {
     clear_screen
     draw_brand
-    printf '\n%s[02] 系统信息%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s系统与维护 > 系统信息%s\n\n' "$YELLOW" "$RESET"
     printf '%s内核:%s %s\n' "$DIM" "$RESET" "$(uname -srmo 2>/dev/null || printf 'unknown')"
     printf '%s主机:%s %s\n' "$DIM" "$RESET" "$(hostname 2>/dev/null || printf 'unknown')"
     printf '%s时间:%s %s\n' "$DIM" "$RESET" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -2852,36 +2958,41 @@ show_system_info() {
 }
 
 show_service_menu() {
-    clear_screen
-    draw_brand
-    printf '\n%s[03] 服务管理%s\n\n' "$YELLOW" "$RESET"
-    printf '%s1%s 启动并设置开机自启\n' "$GREEN" "$RESET"
-    printf '%s2%s 重启限速服务\n' "$GREEN" "$RESET"
-    printf '%s3%s 停止限速服务\n' "$GREEN" "$RESET"
-    printf '%s4%s 查看服务状态\n' "$GREEN" "$RESET"
-    printf '%sB%s 返回\n\n' "$GREEN" "$RESET"
-    printf '%s选择:%s ' "$CYAN" "$RESET"
-    read -r choice
-    case "$choice" in
-        1)
-            run_root systemctl enable --now limit-ports.service || true
+    local choice active enabled
+    while true; do
+        clear_screen
+        draw_brand
+        printf '\n%s[04] 限速服务%s\n\n' "$YELLOW" "$RESET"
+        if ! command -v systemctl >/dev/null 2>&1; then
+            printf '%s当前系统没有 systemctl，无法管理限速服务。%s\n' "$YELLOW" "$RESET"
             pause_screen
-            ;;
-        2)
-            run_root systemctl restart limit-ports.service || true
-            pause_screen
-            ;;
-        3)
-            run_root systemctl stop limit-ports.service || true
-            pause_screen
-            ;;
-        4)
-            run_root systemctl --no-pager --full status limit-ports.service || true
-            pause_screen
-            ;;
-        b|B|"") ;;
-        *) printf '%s未知选项%s\n' "$RED" "$RESET"; pause_screen ;;
-    esac
+            return
+        fi
+        active="$(systemctl is-active limit-ports.service 2>/dev/null)" || active="${active:-unknown}"
+        enabled="$(systemctl is-enabled limit-ports.service 2>/dev/null)" || enabled="${enabled:-unknown}"
+        printf '%s运行状态:%s %s    %s开机自启:%s %s\n\n' \
+            "$DIM" "$RESET" "$active" "$DIM" "$RESET" "$enabled"
+        printf '%s1.%s 启动限速服务\n' "$GREEN" "$RESET"
+        printf '%s2.%s 重启限速服务\n' "$GREEN" "$RESET"
+        printf '%s3.%s 停止限速服务\n' "$YELLOW" "$RESET"
+        printf '%s4.%s 开启开机自启\n' "$GREEN" "$RESET"
+        printf '%s5.%s 关闭开机自启\n' "$GREEN" "$RESET"
+        printf '%s6.%s 查看详细状态\n' "$GREEN" "$RESET"
+        printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice || return 0
+        case "$choice" in
+            1) run_root systemctl start limit-ports.service || true ;;
+            2) run_root systemctl restart limit-ports.service || true ;;
+            3) run_root systemctl stop limit-ports.service || true ;;
+            4) run_root systemctl enable limit-ports.service || true ;;
+            5) run_root systemctl disable limit-ports.service || true ;;
+            6) run_root systemctl --no-pager --full status limit-ports.service || true ;;
+            0|b|B|"") return ;;
+            *) printf '%s请输入 1-6 或 0。%s\n' "$RED" "$RESET" ;;
+        esac
+        pause_screen
+    done
 }
 
 # ------------------------------------------------------------- log center
@@ -3030,7 +3141,7 @@ log_follow() {
     local choice unit label
     clear_screen
     draw_brand
-    printf '\n%s[05-7] 实时跟踪%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s日志中心 > 实时跟踪%s\n\n' "$YELLOW" "$RESET"
     printf '%s1.%s 限速服务\n' "$GREEN" "$RESET"
     printf '%s2.%s 防火墙服务\n' "$GREEN" "$RESET"
     printf '%s3.%s 全部系统日志\n' "$GREEN" "$RESET"
@@ -3165,7 +3276,7 @@ log_vacuum() {
     local choice
     clear_screen
     draw_brand
-    printf '\n%s[05-9] 清理日志%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s日志中心 > 高级与清理 > 清理日志%s\n\n' "$YELLOW" "$RESET"
 
     if [[ "$(log_backend)" != "journald" ]]; then
         printf '%s只有 journald 才支持这里的清理功能。%s\n' "$RED" "$RESET"
@@ -3198,6 +3309,60 @@ log_vacuum() {
     esac
 }
 
+show_service_logs_menu() {
+    local choice lines
+    while true; do
+        clear_screen
+        draw_brand
+        printf '\n%s日志中心 > 服务日志%s\n\n' "$YELLOW" "$RESET"
+        printf '%s1.%s 限速服务日志\n' "$GREEN" "$RESET"
+        printf '%s2.%s 防火墙服务日志\n' "$GREEN" "$RESET"
+        printf '%s0.%s 返回日志中心\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice || return 0
+        case "$choice" in
+            1|2)
+                lines="$(log_prompt_lines)" || continue
+                if [[ "$choice" == 1 ]]; then
+                    log_emit "限速服务日志（limit-ports.service）" "$lines" 'limit-ports' -u limit-ports.service
+                else
+                    log_emit "防火墙服务日志（portctl-firewall.service）" "$lines" 'portctl-firewall' -u portctl-firewall.service
+                fi
+                ;;
+            0|"") return ;;
+            *) printf '%s请输入 1-2 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+        esac
+    done
+}
+
+show_logs_advanced_menu() {
+    local choice lines
+    while true; do
+        clear_screen
+        draw_brand
+        printf '\n%s日志中心 > 高级与清理%s\n\n' "$YELLOW" "$RESET"
+        printf '%s1.%s 内核日志\n' "$GREEN" "$RESET"
+        printf '%s2.%s 全部系统日志\n' "$GREEN" "$RESET"
+        printf '%s3.%s 清理日志\n' "$RED" "$RESET"
+        printf '%s0.%s 返回日志中心\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice || return 0
+        case "$choice" in
+            1|2)
+                lines="$(log_prompt_lines)" || continue
+                if [[ "$choice" == 1 ]]; then
+                    log_emit "内核日志" "$lines" 'kernel' -k
+                else
+                    log_emit "全部系统日志" "$lines" -
+                fi
+                ;;
+            3) log_vacuum ;;
+            0|"") return ;;
+            *) printf '%s请输入 1-3 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+        esac
+    done
+}
+
 show_logs_menu() {
     local choice lines backend
     while true; do
@@ -3219,48 +3384,28 @@ show_logs_menu() {
                 ;;
         esac
 
-        printf '\n%s1.%s 限速服务日志\n' "$GREEN" "$RESET"
-        printf '%s2.%s 防火墙服务日志\n' "$GREEN" "$RESET"
-        printf '%s3.%s 系统错误日志\n' "$GREEN" "$RESET"
-        printf '%s4.%s 登录记录（成功 / 失败）\n' "$GREEN" "$RESET"
-        printf '%s5.%s 内核日志\n' "$GREEN" "$RESET"
-        printf '%s6.%s 全部系统日志\n' "$GREEN" "$RESET"
-        printf '%s7.%s 实时跟踪（Ctrl+C 返回）\n' "$GREEN" "$RESET"
-        printf '%s8.%s 导出诊断日志到文件\n' "$GREEN" "$RESET"
-        printf '%s9.%s 清理日志\n' "$GREEN" "$RESET"
+        printf '\n%s1.%s 服务日志\n' "$GREEN" "$RESET"
+        printf '%s2.%s 系统错误日志\n' "$GREEN" "$RESET"
+        printf '%s3.%s 登录记录（成功 / 失败）\n' "$GREEN" "$RESET"
+        printf '%s4.%s 实时跟踪\n' "$GREEN" "$RESET"
+        printf '%s5.%s 导出诊断日志\n' "$GREEN" "$RESET"
+        printf '%s6.%s 高级与清理\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
-        read -r choice
+        read -r choice || return 0
 
         case "$choice" in
-            1)
-                lines="$(log_prompt_lines)" || continue
-                log_emit "限速服务日志（limit-ports.service）" "$lines" 'limit-ports' \
-                    -u limit-ports.service
-                ;;
+            1) show_service_logs_menu ;;
             2)
-                lines="$(log_prompt_lines)" || continue
-                log_emit "防火墙服务日志（portctl-firewall.service）" "$lines" 'portctl-firewall' \
-                    -u portctl-firewall.service
-                ;;
-            3)
                 lines="$(log_prompt_lines)" || continue
                 log_emit "系统错误日志" "$lines" 'error|fail|critical|panic|denied' -p err
                 ;;
-            4) log_view_login ;;
-            5)
-                lines="$(log_prompt_lines)" || continue
-                log_emit "内核日志" "$lines" 'kernel' -k
-                ;;
-            6)
-                lines="$(log_prompt_lines)" || continue
-                log_emit "全部系统日志" "$lines" -
-                ;;
-            7) log_follow ;;
-            8) log_export_flow ;;
-            9) log_vacuum ;;
+            3) log_view_login ;;
+            4) log_follow ;;
+            5) log_export_flow ;;
+            6) show_logs_advanced_menu ;;
             0|"") return ;;
-            *) printf '%s请输入 1-9 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+            *) printf '%s请输入 1-6 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
         esac
     done
 }
@@ -3282,15 +3427,18 @@ download_file() {
 update_script() {
     clear_screen
     draw_brand
-    printf '\n%s[06] 更新脚本%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s系统与维护 > 更新脚本%s\n\n' "$YELLOW" "$RESET"
     printf '%s正在从 GitHub 获取最新版本...%s\n' "$DIM" "$RESET"
     local tmp_dir installer
-    tmp_dir="$(mktemp -d)"
+    tmp_dir="$(mktemp -d)" || return 1
     installer="$tmp_dir/install.sh"
     if download_file "$INSTALL_URL" "$installer"; then
         chmod 0755 "$installer"
-        run_root bash "$installer" --no-menu
-        printf '\n%s更新完成，现有配置已保留。%s\n' "$GREEN" "$RESET"
+        if run_root bash "$installer" --no-menu; then
+            printf '\n%s更新完成，现有配置已保留。重新打开 zc 后使用新版本。%s\n' "$GREEN" "$RESET"
+        else
+            printf '%s安装失败，请检查上方错误信息。%s\n' "$RED" "$RESET"
+        fi
     else
         printf '%s更新失败，请检查网络或稍后重试。%s\n' "$RED" "$RESET"
     fi
@@ -3299,14 +3447,15 @@ update_script() {
 }
 
 uninstall_program() {
+    local confirmation remove_config
     clear_screen
     draw_brand
-    printf '\n%s[07] 卸载程序%s\n\n' "$YELLOW" "$RESET"
+    printf '\n%s系统与维护 > 卸载程序%s\n\n' "$YELLOW" "$RESET"
     printf '%s这将停止服务并删除 zc、portctl.sh 和 limit_ports.sh。%s\n' "$RED" "$RESET"
     printf '%s同时会移除 portctl-firewall.service 与流量统计定时器（不会主动撤销已下发的防火墙规则）。%s\n' "$DIM" "$RESET"
     printf '%s默认保留 /etc/default/limit-ports 配置与流量统计累积数据。%s\n\n' "$DIM" "$RESET"
     printf '确认卸载请输入 %sYES%s，其他输入取消: ' "$RED" "$RESET"
-    read -r confirmation
+    read -r confirmation || return 0
     [[ "$confirmation" == "YES" ]] || {
         printf '%s已取消卸载。%s\n' "$DIM" "$RESET"
         pause_screen
@@ -3314,7 +3463,7 @@ uninstall_program() {
     }
 
     printf '\n是否同时删除配置 /etc/default/limit-ports？[y/N]: '
-    read -r remove_config
+    read -r remove_config || return 0
     if command -v systemctl >/dev/null 2>&1; then
         run_root systemctl disable --now limit-ports.service 2>/dev/null || true
         run_root rm -f /etc/systemd/system/limit-ports.service
@@ -3343,22 +3492,44 @@ uninstall_program() {
     exit 0
 }
 
+show_maintenance_menu() {
+    local choice
+    while true; do
+        clear_screen
+        draw_brand
+        printf '\n%s[06] 系统与维护%s\n\n' "$YELLOW" "$RESET"
+        printf '%s1.%s 系统信息\n' "$GREEN" "$RESET"
+        printf '%s2.%s 从 GitHub 更新脚本\n' "$GREEN" "$RESET"
+        printf '%s3.%s 卸载程序\n' "$RED" "$RESET"
+        printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice || return 0
+        case "$choice" in
+            1) show_system_info ;;
+            2) update_script ;;
+            3) uninstall_program ;;
+            0|"") return ;;
+            *) printf '%s请输入 1-3 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
+        esac
+    done
+}
+
 main_menu() {
+    local choice
     while true; do
         clear_screen
         draw_brand
         draw_status
         draw_menu
         printf '\n%s请输入你的选择:%s ' "$GREEN" "$RESET"
-        read -r choice
+        read -r choice || return 0
         case "$choice" in
             1|01) show_limit_menu ;;
-            2|02) show_system_info ;;
-            3|03) show_service_menu ;;
-            4|04) show_firewall_menu ;;
+            2|02) show_traffic_menu ;;
+            3|03) show_firewall_menu ;;
+            4|04) show_service_menu ;;
             5|05) show_logs_menu ;;
-            6|06) update_script ;;
-            7|07) uninstall_program ;;
+            6|06) show_maintenance_menu ;;
             00) continue ;;
             0|q|Q)
                 clear_screen
