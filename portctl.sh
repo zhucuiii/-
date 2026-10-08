@@ -157,7 +157,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.6.3%s\n' "$CYAN" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.6.4%s\n' "$CYAN" "$RESET"
     printf '%s输入编号进入模块，0 退出，00 刷新%s\n' "$DIM" "$RESET"
 }
 
@@ -992,6 +992,422 @@ show_all_port_traffic() {
     pause_screen
 }
 
+# ------------------------------------------------- traffic accounting
+#
+# tc counters only exist on egress, so they can only answer "how much did the
+# server send to this user". For per-port totals in BOTH directions we let the
+# kernel count itself with nftables named counters, referenced from two maps so
+# the lookup stays a hash instead of a few hundred rules evaluated per packet.
+#
+#   ingress, user upload   : prerouting,  dport == the user's port
+#   egress,  user download : postrouting, sport == the user's port
+#
+# `nft reset counters` both dumps and clears in one go, so folding the live
+# counters into a file on disk never drops a packet, and the totals survive a
+# reboot even though the nft rules themselves do not.
+
+ACCT_TABLE="${ACCT_TABLE:-portctl_acct}"
+ACCT_DIR="${ACCT_DIR:-/var/lib/portctl}"
+ACCT_FILE="${ACCT_FILE:-$ACCT_DIR/traffic.tsv}"
+ACCT_SERVICE_FILE="${ACCT_SERVICE_FILE:-/etc/systemd/system/portctl-accounting.service}"
+ACCT_TIMER_FILE="${ACCT_TIMER_FILE:-/etc/systemd/system/portctl-accounting.timer}"
+ACCT_TIMER_NAME="portctl-accounting.timer"
+ACCT_MAX_PORTS="${ACCT_MAX_PORTS:-512}"
+
+acct_available() {
+    command -v nft >/dev/null 2>&1
+}
+
+acct_table_exists() {
+    nft list table inet "$ACCT_TABLE" >/dev/null 2>&1
+}
+
+# 按当前端口规则展开成端口列表；超过上限则返回 1
+acct_ports() {
+    local i p
+    local -a out=()
+    for ((i = 0; i < ${#RULE_IDX[@]}; i++)); do
+        for ((p = RULE_START[i]; p <= RULE_END[i]; p++)); do
+            out+=("$p")
+            if (( ${#out[@]} > ACCT_MAX_PORTS )); then
+                return 1
+            fi
+        done
+    done
+    ((${#out[@]})) || return 1
+    printf '%s\n' "${out[@]}"
+    return 0
+}
+
+acct_build_script() {
+    local -a ports=()
+    local p els_up="" els_down=""
+    readarray -t ports < <(acct_ports) || return 1
+    ((${#ports[@]})) || return 1
+
+    for p in "${ports[@]}"; do
+        els_up+="${els_up:+, }$p : \"up_$p\""
+        els_down+="${els_down:+, }$p : \"down_$p\""
+    done
+
+    printf 'table inet %s {\n' "$ACCT_TABLE"
+    for p in "${ports[@]}"; do
+        printf '    counter up_%s {\n    }\n' "$p"
+        printf '    counter down_%s {\n    }\n' "$p"
+    done
+    printf '    map up {\n        type inet_service : counter\n        elements = { %s }\n    }\n' "$els_up"
+    printf '    map down {\n        type inet_service : counter\n        elements = { %s }\n    }\n' "$els_down"
+    printf '    chain pre {\n'
+    printf '        type filter hook prerouting priority -150; policy accept;\n'
+    printf '        counter name tcp dport map @up\n'
+    printf '        counter name udp dport map @up\n'
+    printf '    }\n'
+    printf '    chain post {\n'
+    printf '        type filter hook postrouting priority 150; policy accept;\n'
+    printf '        counter name tcp sport map @down\n'
+    printf '        counter name udp sport map @down\n'
+    printf '    }\n'
+    printf '}\n'
+}
+
+acct_setup() {
+    acct_available || {
+        printf '找不到 nft 命令，无法建立流量统计。\n' >&2
+        return 1
+    }
+    load_rules || true
+    if (( ${#RULE_IDX[@]} == 0 )); then
+        printf '当前没有任何端口规则，请先在 [01] 里配置限速端口。\n' >&2
+        return 1
+    fi
+
+    local script n
+    script="$(mktemp)" || return 1
+    if ! acct_build_script >"$script"; then
+        rm -f "$script"
+        printf '端口数量超过 ACCT_MAX_PORTS=%s，未建立统计。\n' "$ACCT_MAX_PORTS" >&2
+        return 1
+    fi
+    n="$(acct_ports | wc -l)"
+
+    nft delete table inet "$ACCT_TABLE" 2>/dev/null || true
+    if ! nft -f "$script"; then
+        rm -f "$script"
+        printf 'nft 规则加载失败（上面是内核报错）。\n' >&2
+        return 1
+    fi
+    rm -f "$script"
+    printf '统计规则已建立: %s 个端口 × 2 个方向。\n' "$n"
+    return 0
+}
+
+acct_remove() {
+    if acct_table_exists; then
+        nft delete table inet "$ACCT_TABLE" && printf '统计规则已移除（磁盘上的累计数据保留）。\n'
+    else
+        printf '统计规则本来就不存在。\n'
+    fi
+    return 0
+}
+
+# 输出: port<TAB>up<TAB>down
+# $1 = reset（读取并清零，用于折叠）| 省略（只读）
+acct_read_counters() {
+    local mode="${1:-read}" out
+    if [[ "$mode" == "reset" ]]; then
+        out="$(nft reset counters table inet "$ACCT_TABLE" 2>/dev/null || true)"
+    else
+        out="$(nft list counters table inet "$ACCT_TABLE" 2>/dev/null || true)"
+    fi
+    if [[ -z "$out" ]]; then
+        return 0
+    fi
+
+    printf '%s\n' "$out" | awk '
+        /counter (up|down)_[0-9]+/ {
+            name = $2
+            next
+        }
+        /packets/ {
+            if (name == "") { next }
+            split(name, part, "_")
+            p = part[2]
+            if (part[1] == "up") { up[p] += $4 }
+            else { down[p] += $4 }
+            name = ""
+        }
+        END {
+            for (p in up) { printf "%s\t%d\t%d\n", p, up[p], down[p] + 0 }
+            for (p in down) { if (!(p in up)) { printf "%s\t0\t%d\n", p, down[p] } }
+        }
+    '
+}
+
+acct_load_totals() {
+    [[ -f "$ACCT_FILE" ]] || return 0
+    awk -F'\t' '$1 !~ /^#/ && NF >= 3 { printf "%s\t%s\t%s\n", $1, $2, $3 }' "$ACCT_FILE"
+}
+
+# 已有累计 + 尚未折叠的实时计数
+acct_current() {
+    printf '%s\n%s\n' "$(acct_load_totals)" "$(acct_read_counters read)" |
+        awk -F'\t' '
+            $1 ~ /^#/ { next }
+            NF >= 3 { up[$1] += $2; down[$1] += $3 }
+            END { for (p in up) { printf "%s\t%d\t%d\n", p, up[p], down[p] } }
+        ' | sort -n
+}
+
+# 把实时计数原子地读走并清零，累加进磁盘
+acct_sample() {
+    acct_available || return 1
+
+    # 重启后 nft 规则不存在，先自愈重建（新计数器从 0 开始，本次没有可折叠的数据）
+    if ! acct_table_exists; then
+        acct_setup || return 1
+        return 0
+    fi
+
+    local live
+    live="$(acct_read_counters reset)"
+    if [[ -z "$live" ]]; then
+        return 0
+    fi
+
+    install -d -m 0755 "$ACCT_DIR" || return 1
+    local tmp ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    tmp="$(mktemp)" || return 1
+
+    {
+        printf '# port\tup_bytes\tdown_bytes\tupdated\n'
+        {
+            acct_load_totals
+            printf '%s\n' "$live"
+        } | awk -F'\t' -v ts="$ts" '
+            $1 ~ /^#/ { next }
+            NF >= 3 { up[$1] += $2; down[$1] += $3 }
+            END {
+                for (p in up) { printf "%s\t%d\t%d\t%s\n", p, up[p], down[p], ts }
+            }
+        ' | sort -n
+    } >"$tmp"
+
+    if ! mv -f "$tmp" "$ACCT_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+acct_reset() {
+    acct_available || return 1
+    nft reset counters table inet "$ACCT_TABLE" >/dev/null 2>&1 || true
+    install -d -m 0755 "$ACCT_DIR" || return 1
+    [[ -f "$ACCT_FILE" ]] && rm -f "$ACCT_FILE"
+    printf '累计流量已清零。\n'
+    return 0
+}
+
+acct_autostart_enabled() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl is-enabled "$ACCT_TIMER_NAME" >/dev/null 2>&1
+}
+
+acct_autostart_label() {
+    if acct_autostart_enabled; then
+        printf '已开启（每分钟）'
+    else
+        printf '未开启'
+    fi
+}
+
+acct_autostart_on() {
+    local self tmp
+    self="$(fw_installed_self)"
+    tmp="$(mktemp)" || return 1
+
+    {
+        printf '[Unit]\n'
+        printf 'Description=portctl traffic accounting sample\n\n'
+        printf '[Service]\n'
+        printf 'Type=oneshot\n'
+        printf 'ExecStart=%s acct-sample\n' "$self"
+    } >"$tmp"
+    if ! run_root install -m 0644 "$tmp" "$ACCT_SERVICE_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    {
+        printf '[Unit]\n'
+        printf 'Description=portctl traffic accounting timer\n\n'
+        printf '[Timer]\n'
+        printf 'OnBootSec=2min\n'
+        printf 'OnUnitActiveSec=1min\n\n'
+        printf '[Install]\n'
+        printf 'WantedBy=timers.target\n'
+    } >"$tmp"
+    if ! run_root install -m 0644 "$tmp" "$ACCT_TIMER_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+
+    run_root systemctl daemon-reload || true
+    run_root systemctl enable --now "$ACCT_TIMER_NAME"
+}
+
+acct_autostart_off() {
+    if command -v systemctl >/dev/null 2>&1; then
+        run_root systemctl disable --now "$ACCT_TIMER_NAME" 2>/dev/null || true
+    fi
+    run_root rm -f "$ACCT_TIMER_FILE" "$ACCT_SERVICE_FILE"
+    if command -v systemctl >/dev/null 2>&1; then
+        run_root systemctl daemon-reload 2>/dev/null || true
+    fi
+    return 0
+}
+
+# 输出: 合计<TAB>端口<TAB>上行<TAB>下行<TAB>限速，最后一行是 #TOTAL<TAB>上行<TAB>下行
+acct_rows_for_menu() {
+    local data
+    data="$(acct_current)"
+    local -A up=() down=()
+    local p u d
+
+    while IFS=$'\t' read -r p u d; do
+        if [[ -n "$p" ]]; then
+            up["$p"]="${u:-0}"
+            down["$p"]="${d:-0}"
+        fi
+    done <<<"$data"
+
+    local i port tot_u=0 tot_d=0 rows=""
+    for ((i = 0; i < ${#RULE_IDX[@]}; i++)); do
+        for ((port = RULE_START[i]; port <= RULE_END[i]; port++)); do
+            u="${up[$port]:-0}"
+            d="${down[$port]:-0}"
+            tot_u=$((tot_u + u))
+            tot_d=$((tot_d + d))
+            rows+="$((u + d))"$'\t'"$port"$'\t'"$u"$'\t'"$d"$'\t'"${RULE_RATE[i]}"$'\n'
+        done
+    done
+
+    printf '%s' "$rows"
+    printf '#TOTAL\t%s\t%s\n' "$tot_u" "$tot_d"
+}
+
+show_traffic_accounting() {
+    local choice data rows total_line
+
+    while true; do
+        clear_screen
+        draw_brand
+        printf '\n%s[01-10] 流量统计（每端口上行 / 下行）%s\n' "$YELLOW" "$RESET"
+
+        if ! acct_available; then
+            printf '\n%s找不到 nft 命令，这个功能需要 nftables。%s\n' "$RED" "$RESET"
+            pause_screen
+            return
+        fi
+
+        data="$(run_root bash "$SELF_PATH" acct-show 2>&1)"
+        rows="$(printf '%s\n' "$data" | grep -v '^#TOTAL' || true)"
+        total_line="$(printf '%s\n' "$data" | grep '^#TOTAL' || true)"
+
+        local n_rows n_active
+        n_rows="$(printf '%s\n' "$rows" | grep -c '^[0-9]' || true)"
+        n_active="$(printf '%s\n' "$rows" | awk -F'\t' '$1 > 0' | grep -c '^[0-9]' || true)"
+        n_rows="${n_rows:-0}"
+        n_active="${n_active:-0}"
+
+        # 只显示真的有过流量的端口
+        if (( n_active == 0 )); then
+            printf '\n%s  还没有任何一个端口产生过流量。%s\n' "$DIM" "$RESET"
+        else
+            local head row
+            head="  $(pad '端口' 10) $(pad '上行（用户上传）' 18) $(pad '下行（用户下载）' 18) $(pad '合计' 12) 限速"
+            printf '\n%s%s%s\n' "$DIM" "$head" "$RESET"
+            printf '%s\n' "$rows" | awk -F'\t' '$1 > 0' | sort -rn -k1,1 | head -n 30 |
+                while IFS=$'\t' read -r _t port u d rate; do
+                    [[ -n "$port" ]] || continue
+                    row="  $(pad "$port" 10) $(pad "$(human_bytes "$u")" 18) $(pad "$(human_bytes "$d")" 18) $(pad "$(human_bytes "$((u + d))")" 12) $rate"
+                    printf '%s\n' "$row"
+                done
+            if (( n_active > 30 )); then
+                printf '\n%s  有流量的端口共 %s 个，只显示合计最高的 30 个。%s\n' "$DIM" "$n_active" "$RESET"
+            fi
+        fi
+
+        if [[ -n "$total_line" ]]; then
+            IFS=$'\t' read -r _ tu td <<<"$total_line"
+            printf '%s  端口总数 %s   有过流量 %s%s\n' "$DIM" "$n_rows" "$n_active" "$RESET"
+            printf '%s  总计: 上行 %s   下行 %s   合计 %s%s\n' \
+                "$DIM" "$(human_bytes "$tu")" "$(human_bytes "$td")" \
+                "$(human_bytes "$((tu + td))")" "$RESET"
+        fi
+
+        if acct_table_exists; then
+            printf '%s  统计规则: 已建立    %s自动采样: %s%s\n' \
+                "$DIM" "$DIM" "$(acct_autostart_label)" "$RESET"
+        else
+            printf '%s  统计规则: 未建立（选 2 建立）%s\n' "$YELLOW" "$RESET"
+        fi
+
+        printf '\n%s1.%s 刷新\n' "$GREEN" "$RESET"
+        printf '%s2.%s 按当前端口规则建立 / 重建统计\n' "$GREEN" "$RESET"
+        printf '%s3.%s 清零累计数据\n' "$GREEN" "$RESET"
+        printf '%s4.%s 自动采样开关（systemd timer）\n' "$GREEN" "$RESET"
+        printf '%s5.%s 移除统计规则（保留磁盘数据）\n' "$GREEN" "$RESET"
+        printf '%s0.%s 返回\n' "$GREEN" "$RESET"
+        printf '\n%s选择:%s ' "$CYAN" "$RESET"
+        read -r choice
+
+        case "$choice" in
+            ""|1) continue ;;
+            2)
+                printf '\n'
+                run_root bash "$SELF_PATH" acct-setup || true
+                pause_screen
+                ;;
+            3)
+                printf '\n%s这会清空所有端口的累计流量，不可恢复。确认请输入 YES: %s' "$YELLOW" "$RESET"
+                read -r choice
+                if [[ "$choice" == "YES" ]]; then
+                    run_root bash "$SELF_PATH" acct-reset || true
+                else
+                    printf '%s已取消。%s\n' "$DIM" "$RESET"
+                fi
+                pause_screen
+                ;;
+            4)
+                if acct_autostart_enabled; then
+                    acct_autostart_off
+                    printf '%s已关闭自动采样。%s\n' "$GREEN" "$RESET"
+                else
+                    if acct_autostart_on; then
+                        printf '%s已开启自动采样（每分钟折叠一次，重启不丢）。%s\n' "$GREEN" "$RESET"
+                    else
+                        printf '%s开启失败。%s\n' "$RED" "$RESET"
+                    fi
+                fi
+                pause_screen
+                ;;
+            5)
+                printf '\n'
+                run_root bash "$SELF_PATH" acct-remove || true
+                pause_screen
+                ;;
+            0) return ;;
+            *)
+                printf '%s请输入 1-5 或 0。%s\n' "$RED" "$RESET"
+                pause_screen
+                ;;
+        esac
+    done
+}
+
 show_limit_menu() {
     local choice
 
@@ -1019,6 +1435,7 @@ show_limit_menu() {
         printf '%s7.%s 查看 tc 规则统计\n' "$GREEN" "$RESET"
         printf '%s8.%s 端口实时流量（每端口=每用户）\n' "$GREEN" "$RESET"
         printf '%s9.%s 全部端口流量监控（实时刷新）\n' "$GREEN" "$RESET"
+        printf '%s10.%s 流量统计（每端口上行/下行累计）\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
         read -r choice
@@ -1042,9 +1459,11 @@ show_limit_menu() {
                 ;;
             9) show_all_port_traffic
                 ;;
+            10) show_traffic_accounting
+                ;;
             0|"") return ;;
             *)
-                printf '%s请输入 1-9 或 0。%s\n' "$RED" "$RESET"
+                printf '%s请输入 1-10 或 0。%s\n' "$RED" "$RESET"
                 pause_screen
                 ;;
         esac
@@ -2898,8 +3317,24 @@ case "${1:-menu}" in
         printf '# proto\tport\tbytes\tconnections\n'
         conntrack_by_port
         ;;
+    acct-setup)
+        acct_setup
+        ;;
+    acct-sample)
+        acct_sample
+        ;;
+    acct-show)
+        load_rules || true
+        acct_rows_for_menu
+        ;;
+    acct-reset)
+        acct_reset
+        ;;
+    acct-remove)
+        acct_remove
+        ;;
     --help|-h)
-        printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status|logs-export <条数> <路径>]\n' "$0"
+        printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status|logs-export <条数> <路径>|traffic|acct-setup|acct-sample|acct-show|acct-reset|acct-remove]\n' "$0"
         printf 'SSH 登录服务器后直接运行即可。默认进入交互式终端菜单。\n'
         ;;
     *)
