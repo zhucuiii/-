@@ -59,12 +59,14 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 printf '[portctl] 下载组件...\n'
 download "$RAW_BASE/portctl.sh" "$tmp_dir/portctl.sh"
+download "$RAW_BASE/policy_engine.sh" "$tmp_dir/policy_engine.sh"
 download "$RAW_BASE/limit_ports.sh" "$tmp_dir/limit_ports.sh"
 download "$RAW_BASE/config/limit-ports.example" "$tmp_dir/limit-ports.example"
 download "$RAW_BASE/systemd/limit-ports.service" "$tmp_dir/limit-ports.service"
 
 install -d -m 0755 "$BIN_DIR" "$CONFIG_DIR" "$SYSTEMD_DIR" "$ALIAS_DIR"
 install -m 0755 "$tmp_dir/portctl.sh" "$BIN_DIR/portctl.sh"
+install -m 0644 "$tmp_dir/policy_engine.sh" "$BIN_DIR/policy_engine.sh"
 install -m 0755 "$tmp_dir/limit_ports.sh" "$BIN_DIR/limit_ports.sh"
 install -m 0644 "$tmp_dir/limit-ports.service" "$SYSTEMD_DIR/limit-ports.service"
 ln -sfn "$BIN_DIR/portctl.sh" "$ALIAS_DIR/zc"

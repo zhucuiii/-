@@ -13,8 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Check Bash syntax
-        run: bash -n portctl.sh limit_ports.sh install.sh tests/accounting.sh tests/menus.sh
+        run: bash -n portctl.sh policy_engine.sh limit_ports.sh install.sh tests/accounting.sh tests/menus.sh tests/policy.sh
       - name: Accounting regression tests
         run: bash tests/accounting.sh
       - name: Menu regression tests
         run: bash tests/menus.sh
+      - name: Policy regression tests
+        run: bash tests/policy.sh

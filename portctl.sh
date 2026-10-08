@@ -13,6 +13,9 @@ if [[ ! -f "$LIMIT_SCRIPT" ]]; then
     LIMIT_SCRIPT="$ROOT_DIR/limit_ports.sh"
 fi
 SELF_PATH="$ROOT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
+if [[ -f "$ROOT_DIR/policy_engine.sh" ]]; then
+    source "$ROOT_DIR/policy_engine.sh"
+fi
 
 if [[ -r "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -157,7 +160,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.7.0%s\n' "$DIM" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.8.0%s\n' "$DIM" "$RESET"
 }
 
 draw_status() {
@@ -176,6 +179,7 @@ draw_menu() {
     printf '%s04.%s  %s限速服务%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s05.%s  %s日志中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s06.%s  %s系统与维护%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s07.%s  %s用量与时段策略%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s----------------------------------------%s\n' "$BLUE" "$RESET"
     printf '%s00.%s  %s刷新状态%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s0.%s   %s退出控制台%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
@@ -1051,6 +1055,7 @@ ACCT_SERVICE_FILE="${ACCT_SERVICE_FILE:-/etc/systemd/system/portctl-accounting.s
 ACCT_TIMER_FILE="${ACCT_TIMER_FILE:-/etc/systemd/system/portctl-accounting.timer}"
 ACCT_TIMER_NAME="portctl-accounting.timer"
 ACCT_MAX_PORTS="${ACCT_MAX_PORTS:-512}"
+ACCT_LOCK_FILE="${ACCT_LOCK_FILE:-$ACCT_DIR/accounting.lock}"
 # 临时的 stderr 暂存文件，只用于把诊断信息和数据分开
 ACCT_ERR_FILE="${ACCT_ERR_FILE:-${TMPDIR:-/tmp}/portctl-acct-err.$$}"
 
@@ -1061,6 +1066,28 @@ acct_available() {
 acct_table_exists() {
     nft list table inet "$ACCT_TABLE" >/dev/null 2>&1
 }
+
+acct_with_lock() (
+    install -d -m 0755 "$ACCT_DIR" || exit 1
+    if command -v flock >/dev/null 2>&1; then
+        exec {acct_lock_fd}>"$ACCT_LOCK_FILE" || exit 1
+        flock -w 30 "$acct_lock_fd" || exit 1
+        "$@"
+        exit $?
+    fi
+    local lockdir="${ACCT_LOCK_FILE}.d" attempt=0
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        attempt=$((attempt + 1))
+        (( attempt < 300 )) || { printf '[acct] 统计操作正在执行，请稍后重试。\n' >&2; exit 1; }
+        sleep 0.1
+    done
+    trap 'rm -rf "$lockdir"' EXIT
+    "$@"
+)
+acct_setup() { acct_with_lock acct_setup_locked; }
+acct_sample() { acct_with_lock acct_sample_locked; }
+acct_remove() { acct_with_lock acct_remove_locked; }
+acct_reset() { acct_with_lock acct_reset_locked; }
 
 # 按当前端口规则展开成端口列表；超过上限则返回 1
 acct_ports() {
@@ -1110,7 +1137,7 @@ acct_build_script() {
     printf '}\n'
 }
 
-acct_setup() {
+acct_setup_locked() {
     acct_available || {
         printf '找不到 nft 命令，无法建立流量统计。\n' >&2
         return 1
@@ -1129,6 +1156,13 @@ acct_setup() {
         return 1
     fi
     n="$(acct_ports | wc -l)"
+    # Delete and create in one checked transaction, preserving the old table on failure.
+    if acct_table_exists; then
+        local replacement
+        replacement="$(mktemp)" || { rm -f "$script"; return 1; }
+        { printf 'delete table inet %s\n' "$ACCT_TABLE"; cat "$script"; } >"$replacement"
+        mv -f "$replacement" "$script"
+    fi
 
     # 先用 -c（check）让 nft 只解析不执行：语法/内核校验不过就直接放弃，
     # 已经存在的旧统计表原封不动，不会出现"删了旧表又装不上新表"。
@@ -1138,7 +1172,9 @@ acct_setup() {
         return 1
     fi
 
-    nft delete table inet "$ACCT_TABLE" 2>/dev/null || true
+    if acct_table_exists; then
+        ACCT_SKIP_EXPECTED=1 acct_sample_locked || { rm -f "$script"; return 1; }
+    fi
     if ! nft -f "$script"; then
         rm -f "$script"
         printf 'nft 规则加载失败（上面是内核报错）。\n' >&2
@@ -1155,8 +1191,9 @@ acct_setup() {
     return 0
 }
 
-acct_remove() {
+acct_remove_locked() {
     if acct_table_exists; then
+        ACCT_SKIP_EXPECTED=1 acct_sample_locked || return 1
         nft delete table inet "$ACCT_TABLE" && printf '统计规则已移除（磁盘上的累计数据保留）。\n'
     else
         printf '统计规则本来就不存在。\n'
@@ -1197,7 +1234,7 @@ acct_read_counters() {
     # 该有的计数器一个都不能少，少一个就意味着有字节会被漏掉。
     expected="$(acct_ports 2>/dev/null | wc -l)" || expected=0
     seen="$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*counter (up|down)_[0-9]+' || true)"
-    if (( expected > 0 )) && (( seen != expected * 2 )); then
+    if [[ "${ACCT_SKIP_EXPECTED:-0}" != 1 ]] && (( expected > 0 )) && (( seen != expected * 2 )); then
         printf '[acct] 只读到 %s/%s 个计数器，放弃本次读取。\n' \
             "$seen" "$((expected * 2))" >&2
         if (( seen > 0 )); then
@@ -1221,8 +1258,8 @@ acct_read_counters() {
             name = ""
         }
         END {
-            for (p in up) { printf "%s\t%d\t%d\n", p, up[p], down[p] + 0 }
-            for (p in down) { if (!(p in up)) { printf "%s\t0\t%d\n", p, down[p] } }
+            for (p in up) { printf "%s\t%.0f\t%.0f\n", p, up[p], down[p] + 0 }
+            for (p in down) { if (!(p in up)) { printf "%s\t0\t%.0f\n", p, down[p] } }
         }
     '
 }
@@ -1241,18 +1278,18 @@ acct_current() {
         awk -F'\t' '
             $1 ~ /^#/ { next }
             NF >= 3 { up[$1] += $2; down[$1] += $3 }
-            END { for (p in up) { printf "%s\t%d\t%d\n", p, up[p], down[p] } }
+            END { for (p in up) { printf "%s\t%.0f\t%.0f\n", p, up[p], down[p] } }
         ' | sort -n || return $?
     return "$rc"
 }
 
 # 把实时计数原子地读走并清零，累加进磁盘
-acct_sample() {
+acct_sample_locked() {
     acct_available || return 1
 
     # 重启后 nft 规则不存在，先自愈重建（新计数器从 0 开始，本次没有可折叠的数据）
     if ! acct_table_exists; then
-        acct_setup || return 1
+        acct_setup_locked || return 1
         return 0
     fi
 
@@ -1270,7 +1307,7 @@ acct_sample() {
     install -d -m 0755 "$ACCT_DIR" || return 1
     local tmp ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    tmp="$(mktemp)" || return 1
+    tmp="$(mktemp "$ACCT_DIR/traffic.XXXXXX")" || return 1
 
     {
         printf '# port\tup_bytes\tdown_bytes\tupdated\n'
@@ -1281,7 +1318,7 @@ acct_sample() {
             $1 ~ /^#/ { next }
             NF >= 3 { up[$1] += $2; down[$1] += $3 }
             END {
-                for (p in up) { printf "%s\t%d\t%d\t%s\n", p, up[p], down[p], ts }
+                    for (p in up) { printf "%s\t%.0f\t%.0f\t%s\n", p, up[p], down[p], ts }
             }
         ' | sort -n
     } >"$tmp"
@@ -1293,9 +1330,11 @@ acct_sample() {
     return 0
 }
 
-acct_reset() {
+acct_reset_locked() {
     acct_available || return 1
-    nft reset counters table inet "$ACCT_TABLE" >/dev/null 2>&1 || true
+    if acct_table_exists; then
+        nft reset counters table inet "$ACCT_TABLE" >/dev/null || return 1
+    fi
     install -d -m 0755 "$ACCT_DIR" || return 1
     [[ -f "$ACCT_FILE" ]] && rm -f "$ACCT_FILE"
     printf '累计流量已清零。\n'
@@ -1592,6 +1631,7 @@ show_limit_menu() {
         printf '%s4.%s 应用当前配置\n' "$GREEN" "$RESET"
         printf '%s5.%s 流量查看\n' "$GREEN" "$RESET"
         printf '%s6.%s 高级与排障\n' "$GREEN" "$RESET"
+        printf '%s7.%s 用量与时段策略\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
         read -r choice || return 0
@@ -1606,9 +1646,10 @@ show_limit_menu() {
                 ;;
             5) show_traffic_menu ;;
             6) show_limit_advanced_menu ;;
+            7) show_policy_menu ;;
             0|"") return ;;
             *)
-                printf '%s请输入 1-6 或 0。%s\n' "$RED" "$RESET"
+                printf '%s请输入 1-7 或 0。%s\n' "$RED" "$RESET"
                 pause_screen
                 ;;
         esac
@@ -2404,6 +2445,8 @@ fw_autostart_on() {
 
 fw_autostart_off() {
     if command -v systemctl >/dev/null 2>&1; then
+        run_root systemctl disable --now portctl-policy.timer 2>/dev/null || true
+        run_root rm -f /etc/systemd/system/portctl-policy.timer /etc/systemd/system/portctl-policy.service
         run_root systemctl disable --now "$FW_UNIT_NAME" 2>/dev/null || true
     fi
     run_root rm -f "$FW_UNIT_FILE"
@@ -3484,6 +3527,7 @@ uninstall_program() {
         run_root rm -f /etc/default/limit-ports
         run_root rm -f "$FW_CONF_FILE"
         run_root rm -f "$ACCT_FILE"
+        run_root rm -f "${POLICY_CONF:-/etc/default/portctl-policy.tsv}" "${POLICY_STATE:-/var/lib/portctl/policy/state.tsv}"
     fi
     printf '%s卸载完成。%s\n' "$GREEN" "$RESET"
     printf '%s当前菜单进程将在返回后退出。%s\n' "$DIM" "$RESET"
@@ -3530,6 +3574,7 @@ main_menu() {
             4|04) show_service_menu ;;
             5|05) show_logs_menu ;;
             6|06) show_maintenance_menu ;;
+            7|07) show_policy_menu ;;
             00) continue ;;
             0|q|Q)
                 clear_screen
@@ -3591,8 +3636,18 @@ case "${1:-menu}" in
     acct-remove)
         acct_remove
         ;;
+    policy-tick|policy-status|policy-add|policy-delete|policy-release)
+        declare -F policy_tick >/dev/null || { printf '缺少 policy_engine.sh，请重新安装。\n' >&2; exit 1; }
+        case "$1" in
+            policy-tick) policy_tick ;;
+            policy-status) policy_status ;;
+            policy-add) [[ $# == 8 ]] || exit 2; policy_add "${@:2}" ;;
+            policy-delete) [[ $# == 2 ]] || exit 2; policy_delete "$2" ;;
+            policy-release) [[ $# == 2 ]] || exit 2; policy_release "$2" ;;
+        esac
+        ;;
     --help|-h)
-        printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status|logs-export <条数> <路径>|traffic|acct-setup|acct-sample|acct-show|acct-reset|acct-remove]\n' "$0"
+        printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status|logs-export <条数> <路径>|traffic|acct-setup|acct-sample|acct-show|acct-reset|acct-remove|policy-tick|policy-status|policy-add|policy-delete|policy-release]\n' "$0"
         printf 'SSH 登录服务器后直接运行即可。默认进入交互式终端菜单。\n'
         ;;
     *)

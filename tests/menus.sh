@@ -51,6 +51,7 @@ check_route() (
     show_system_info() { record info; }
     update_script() { record update; }
     uninstall_program() { record uninstall; }
+    show_policy_menu() { record policy; }
     limit_root() { record "limit:$*"; }
     limit_local() {
         case "$1" in
@@ -96,6 +97,8 @@ check_route $'5\n6\n1\n2\n3\n0\n0\n0' $'log:内核日志\nlog:全部系统日志
 pass "kernel logs and cleanup move to advanced tools"
 check_route $'06\n1\n2\n3\n0\n0' $'info\nupdate\nuninstall'
 pass "maintenance contains system info, update and uninstall"
+check_route $'07\n0\n0' policy
+pass "usage and schedule policies have a top-level entry"
 check_route $'00\n1\n0\n2\n0\n3\n0\n4\n0\n5\n0\n6\n0\n0' ""
 pass "refresh and all top-level returns have no side effects"
 if head -n 25 "$TMP/menu.out" | grep -q '卸载程序'; then

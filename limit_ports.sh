@@ -85,6 +85,7 @@ CBURST="${CBURST:-}"
 
 ACTION="apply"
 ACTION_SPEC=""
+RATE_FILE=""
 SPEC_STRING=""
 SPEC_SOURCE="config"
 START_PORT_GIVEN=0
@@ -150,6 +151,7 @@ usage() {
   limit_ports.sh apply --speed 20mbit
   limit_ports.sh apply --start-port 10001 --end-port 10100 --speed 8mbit
   limit_ports.sh rules
+  limit_ports.sh rate-set --rate-file /path/to/rates.tsv
   limit_ports.sh plan -v
 USAGE
 }
@@ -161,7 +163,7 @@ require_option_value() {
 parse_args() {
     while (($# > 0)); do
         case "$1" in
-            apply|stop|status|rules|stats|plan)
+            apply|stop|status|rules|stats|plan|rate-set)
                 ACTION="$1"
                 shift
                 ;;
@@ -200,6 +202,11 @@ parse_args() {
             --r2q)
                 require_option_value "$@"
                 R2Q="$2"
+                shift 2
+                ;;
+            --rate-file)
+                require_option_value "$@"
+                RATE_FILE="$2"
                 shift 2
                 ;;
             -v|--verbose)
@@ -768,6 +775,51 @@ apply_rules() {
     log "查看统计：tc -s class show dev $NIC"
 }
 
+rate_set() {
+    require_root
+    require_command tc
+    [[ -r "$RATE_FILE" ]] || die "找不到速率覆盖文件: $RATE_FILE"
+    validate_config 1
+    parse_spec "$SPEC_STRING"
+    build_plan
+
+    local -A override=()
+    local start end rate key i batch tmp extra
+    while IFS=$'\t' read -r start end rate extra; do
+        [[ -n "$start" && "$start" != '#'* ]] || continue
+        [[ -z "${extra:-}" ]] || die "速率覆盖文件格式无效。"
+        is_uint "$start" && is_uint "$end" && (( start >= 1 && end <= 65535 && end >= start )) ||
+            die "速率覆盖端口无效: $start-$end"
+        rate="${rate,,}"
+        is_rate "$rate" || die "速率覆盖格式无效: $rate"
+        key="$start-$end"
+        [[ -z "${override[$key]:-}" ]] || die "速率覆盖重复: $key"
+        override["$key"]="$rate"
+    done <"$RATE_FILE"
+
+    batch="$(mktemp "${TMPDIR:-/tmp}/limit-ports-rate.XXXXXX")" || die "无法创建临时文件。"
+    : >"$batch"
+    for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
+        key="${PLAN_START[i]}-${PLAN_END[i]}"
+        if [[ -n "${override[$key]:-}" ]]; then
+            rate="${override[$key]}"
+            printf 'class change dev %s parent 1: classid 1:%s htb rate %s ceil %s burst %s cburst %s\n' \
+                "$NIC" "${PLAN_ID[i]}" "$rate" "$rate" \
+                "$(compute_burst "$rate")" "$(compute_cburst "$rate")" >>"$batch"
+        fi
+    done
+    if [[ ! -s "$batch" ]]; then
+        rm -f "$batch"
+        die "速率覆盖文件没有匹配当前基础规则。"
+    fi
+    tc -batch "$batch" || {
+        rm -f "$batch"
+        die "速率覆盖应用失败，基础规则保持不变。"
+    }
+    rm -f "$batch"
+    log "已更新 ${#override[@]} 条策略速率覆盖。"
+}
+
 list_rules() {
     parse_spec "$SPEC_STRING"
     printf '# idx\tstart\tend\trate\tmode\tports\n'
@@ -921,6 +973,11 @@ main() {
         plan)
             resolve_spec
             plan_rules
+            ;;
+        rate-set)
+            [[ -n "$RATE_FILE" ]] || die "rate-set 需要 --rate-file。"
+            resolve_spec
+            rate_set
             ;;
         *)
             die "用法: $0 {apply|stop|status|rules|stats|plan}"
