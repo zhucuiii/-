@@ -16,10 +16,22 @@
 #     @per-port     every port in the rule gets its own HTB class (default)
 #     @shared       the whole rule shares a single HTB class
 #
-# Rules are separated by spaces, commas, semicolons or newlines.
-# Rules must not overlap: every u32 filter lives in one priority chain and
-# the classifier hashes on its selector, so overlapping rules would match
-# unpredictably. Use @shared or a single rule instead.
+# Design notes:
+#   * The default class (1:1, unmatched traffic) gets a SMALL guaranteed
+#     rate (DEFAULT_GUARANTEE) and a LARGE ceiling (DEFAULT_RATE). HTB's
+#     "rate" is a guarantee, so giving the default class the full link rate
+#     would let it starve every limited port whenever unrelated traffic is
+#     pumping.
+#   * Filters use the flower classifier when available: one filter covers a
+#     whole port range and both IPv4 and IPv6 are shaped. The u32 fallback
+#     only covers IPv4 and needs one filter per port.
+#   * Every shaped class gets an fq_codel child qdisc; otherwise the leaf
+#     queue is a plain FIFO and latency collapses under load.
+#   * Commands are applied through a single `tc -batch` call. On failure the
+#     root qdisc is removed again: fail open, never half-configured.
+#
+# Rules are separated by spaces, commas, semicolons or newlines, and must
+# not overlap.
 #
 # Examples:
 #     PORT_SPEC="10001-10200=12mbit"
@@ -34,6 +46,8 @@
 #
 set -Eeuo pipefail
 
+LIMIT_PORTS_VERSION="0.6.0"
+
 CONFIG_FILE="${CONFIG_FILE:-/etc/default/limit-ports}"
 if [[ -r "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -42,7 +56,11 @@ fi
 
 NIC="${NIC:-eth0}"
 SPEED="${SPEED:-12mbit}"
+# Link capacity. Used as the ceiling of the default class.
 DEFAULT_RATE="${DEFAULT_RATE:-1000mbit}"
+# HTB "rate" is a guarantee, so unmatched traffic only guarantees this much
+# and still bursts up to DEFAULT_RATE when the link is otherwise idle.
+DEFAULT_GUARANTEE="${DEFAULT_GUARANTEE:-1mbit}"
 PORT_START="${PORT_START:-10001}"
 PORT_END="${PORT_END:-10200}"
 CLASS_START="${CLASS_START:-10}"
@@ -50,6 +68,20 @@ R2Q="${R2Q:-100}"
 MAX_CLASSES="${MAX_CLASSES:-4096}"
 MAX_RULES="${MAX_RULES:-512}"
 FILTER_PRIO="${FILTER_PRIO:-10}"
+# IPv4 and IPv6 filters cannot share one prio on the same parent: the kernel
+# answers "Filter with specified priority/protocol not found" (ENOENT).
+FILTER_PRIO6="${FILTER_PRIO6:-$((FILTER_PRIO + 1))}"
+# auto | yes | no  (try the whole batch on a throwaway dummy device first)
+PRECHECK="${PRECHECK:-auto}"
+# auto | flower | u32
+FILTER_KIND="${FILTER_KIND:-auto}"
+# auto | yes | no   (auto = shape IPv6 when the NIC has a global address)
+IPV6_MODE="${IPV6_MODE:-auto}"
+FQ_CODEL="${FQ_CODEL:-yes}"
+FQ_CODEL_OPTS="${FQ_CODEL_OPTS:- flows 256 limit 1024}"
+# empty = derive from the class rate
+BURST="${BURST:-}"
+CBURST="${CBURST:-}"
 
 ACTION="apply"
 ACTION_SPEC=""
@@ -90,17 +122,17 @@ usage() {
   stop         删除 root qdisc，取消全部限速
   status       显示 tc qdisc/class 统计
   rules        打印解析后的限速规则（只读，不改动系统）
-  plan         打印将要执行的 tc 命令（只读，加 -v 输出每一条）
+  plan         打印将要执行的 tc 命令（只读，加 -v 输出完整 batch）
 
 选项:
   --nic IFACE              网卡，默认 eth0
   --spec SPEC              直接指定端口规则，覆盖配置文件
   --speed RATE             默认速率，例如 12mbit、20mbit
-  --default-rate RATE      未匹配流量的速率
+  --default-rate RATE      链路容量，同时是默认 class 的上限
   --start-port PORT        起始端口（兼容旧配置）
   --end-port PORT          结束端口（兼容旧配置）
   --r2q NUMBER             HTB r2q 参数
-  -v, --verbose            plan 时输出每一条 tc 命令
+  -v, --verbose            plan 时输出完整命令
   -h, --help               显示帮助
 
 端口规则语法:
@@ -222,6 +254,99 @@ mode_label() {
     else
         printf '每端口独立'
     fi
+}
+
+rate_to_bps() {
+    local rate="${1,,}"
+    case "$rate" in
+        *tbit) awk "BEGIN { printf \"%.0f\", ${rate%tbit} * 1000000000000 }" ;;
+        *gbit) awk "BEGIN { printf \"%.0f\", ${rate%gbit} * 1000000000 }" ;;
+        *mbit) awk "BEGIN { printf \"%.0f\", ${rate%mbit} * 1000000 }" ;;
+        *kbit) awk "BEGIN { printf \"%.0f\", ${rate%kbit} * 1000 }" ;;
+        *bit) awk "BEGIN { printf \"%.0f\", ${rate%bit} }" ;;
+        *) return 1 ;;
+    esac
+}
+
+# HTB needs a burst large enough to cover one scheduling tick, otherwise the
+# configured rate cannot actually be reached (see tc-htb(8) NOTES).
+compute_burst() {
+    if [[ -n "$BURST" ]]; then
+        printf '%s' "$BURST"
+        return 0
+    fi
+    local bps
+    bps="$(rate_to_bps "$1")" || {
+        printf '15000'
+        return 0
+    }
+    awk -v bps="$bps" 'BEGIN {
+        tick = bps / 8 / 100;
+        b = tick * 2;
+        if (b < 3000) b = 3000;
+        printf "%.0f", b
+    }'
+}
+
+compute_cburst() {
+    if [[ -n "$CBURST" ]]; then
+        printf '%s' "$CBURST"
+        return 0
+    fi
+    local bps
+    bps="$(rate_to_bps "$1")" || {
+        printf '3000'
+        return 0
+    }
+    awk -v bps="$bps" 'BEGIN {
+        c = bps / 8 / 100;
+        if (c < 1500) c = 1500;
+        printf "%.0f", c
+    }'
+}
+
+flower_ok() {
+    case "$FILTER_KIND" in
+        u32) return 1 ;;
+        flower) return 0 ;;
+    esac
+    grep -qw cls_flower /proc/modules 2>/dev/null && return 0
+    modinfo -F filename cls_flower >/dev/null 2>&1 && return 0
+    return 1
+}
+
+filter_kind_label() {
+    if flower_ok; then
+        printf 'flower（支持端口区间与 IPv6）'
+    else
+        printf 'u32（仅 IPv4，逐端口）'
+    fi
+}
+
+nic_has_ipv6() {
+    ip -6 addr show dev "$NIC" scope global 2>/dev/null | grep -q 'inet6'
+}
+
+ipv6_enabled() {
+    case "$IPV6_MODE" in
+        yes) return 0 ;;
+        no) return 1 ;;
+    esac
+    nic_has_ipv6
+}
+
+ipv6_label() {
+    if ipv6_enabled; then
+        printf '已启用'
+    elif [[ "$IPV6_MODE" == "no" ]]; then
+        printf '已关闭（IPV6_MODE=no）'
+    else
+        printf '未启用（网卡没有全局 IPv6 地址）'
+    fi
+}
+
+fq_codel_enabled() {
+    [[ "$FQ_CODEL" == "yes" ]]
 }
 
 # Decide which rule string to use. Precedence:
@@ -381,9 +506,17 @@ build_plan() {
 }
 
 filter_count() {
-    local i total=0
+    local i protos=2 families=1 per total=0
+    if ipv6_enabled; then
+        families=2
+    fi
+    if flower_ok; then
+        printf '%s' "$(( ${#PLAN_ID[@]} * protos * families ))"
+        return 0
+    fi
     for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
-        total=$((total + (PLAN_END[i] - PLAN_START[i] + 1) * 2))
+        per=$((PLAN_END[i] - PLAN_START[i] + 1))
+        total=$((total + per * protos))
     done
     printf '%s' "$total"
 }
@@ -397,8 +530,26 @@ validate_config() {
     is_uint "$MAX_CLASSES" || die "MAX_CLASSES 必须是整数。"
     is_uint "$MAX_RULES" || die "MAX_RULES 必须是整数。"
     is_uint "$FILTER_PRIO" || die "FILTER_PRIO 必须是整数。"
+    is_uint "$FILTER_PRIO6" || die "FILTER_PRIO6 必须是整数。"
+    (( FILTER_PRIO >= 1 && FILTER_PRIO6 >= 1 )) || die "FILTER_PRIO/FILTER_PRIO6 必须大于 0。"
+    (( FILTER_PRIO != FILTER_PRIO6 )) ||
+        die "FILTER_PRIO 与 FILTER_PRIO6 不能相同：同一个 parent 下 IPv4/IPv6 必须用不同 prio。"
+    case "$PRECHECK" in
+        auto|yes|no) ;;
+        *) die "PRECHECK 只能是 auto / yes / no。" ;;
+    esac
     (( CLASS_START >= 1 && CLASS_START <= 65535 )) || die "CLASS_START 超出 class 范围。"
     (( R2Q >= 1 )) || die "R2Q 必须大于 0。"
+    is_rate "${DEFAULT_RATE,,}" || die "DEFAULT_RATE 速率格式无效: $DEFAULT_RATE"
+    is_rate "${DEFAULT_GUARANTEE,,}" || die "DEFAULT_GUARANTEE 速率格式无效: $DEFAULT_GUARANTEE"
+    case "$FILTER_KIND" in
+        auto|flower|u32) ;;
+        *) die "FILTER_KIND 只能是 auto / flower / u32。" ;;
+    esac
+    case "$IPV6_MODE" in
+        auto|yes|no) ;;
+        *) die "IPV6_MODE 只能是 auto / yes / no。" ;;
+    esac
 
     if [[ "$SPEC_SOURCE" == "配置 PORT_START/PORT_END" ]]; then
         is_uint "$PORT_START" || die "PORT_START 必须是整数。"
@@ -409,6 +560,29 @@ validate_config() {
 
     if (( check_nic )); then
         ip link show dev "$NIC" >/dev/null 2>&1 || die "网卡不存在: $NIC"
+    fi
+}
+
+# The kernel picks ephemeral source ports for the server's OWN outbound
+# connections. When that range overlaps the shaped ports, unrelated outbound
+# traffic is throttled together with the service.
+warn_local_port_conflict() {
+    local lo hi i hits=""
+    [[ -r /proc/sys/net/ipv4/ip_local_port_range ]] || return 0
+    read -r lo hi </proc/sys/net/ipv4/ip_local_port_range
+    is_uint "$lo" || return 0
+    is_uint "$hi" || return 0
+
+    for ((i = 0; i < ${#PARSE_START[@]}; i++)); do
+        if (( PARSE_START[i] <= hi && lo <= PARSE_END[i] )); then
+            hits="$hits $(port_range_label "${PARSE_START[i]}" "${PARSE_END[i]}")"
+        fi
+    done
+
+    if [[ -n "$hits" ]]; then
+        log "注意: 限速端口$hits 与内核临时端口范围 $lo-$hi 重叠。"
+        log "      服务器自己的出站连接可能被误限速，建议改窄:"
+        log "      sysctl -w net.ipv4.ip_local_port_range=\"32768 60999\""
     fi
 }
 
@@ -428,6 +602,121 @@ rate_to_mbps() {
     esac
 }
 
+port_match_range() {
+    if [[ "$1" == "$2" ]]; then
+        printf '%s' "$1"
+    else
+        printf '%s-%s' "$1" "$2"
+    fi
+}
+
+proto_number() {
+    if [[ "$1" == "tcp" ]]; then
+        printf '6'
+    else
+        printf '17'
+    fi
+}
+
+emit_filter_cmds() {
+    local out="$1" id="$2" start="$3" end="$4"
+    local proto family port prio
+    local -a families=(ip)
+    if ipv6_enabled; then
+        families+=(ipv6)
+    fi
+
+    for proto in tcp udp; do
+        for family in "${families[@]}"; do
+            if flower_ok; then
+                if [[ "$family" == "ipv6" ]]; then
+                    prio="$FILTER_PRIO6"
+                else
+                    prio="$FILTER_PRIO"
+                fi
+                # flower matches a whole port range in a single filter and
+                # works for both address families.
+                printf 'filter add dev %s protocol %s parent 1: prio %s flower ip_proto %s src_port %s flowid 1:%s\n' \
+                    "$NIC" "$family" "$prio" "$proto" \
+                    "$(port_match_range "$start" "$end")" "$id" >>"$out"
+            else
+                # u32 cannot match IPv6 source ports and has no port ranges.
+                [[ "$family" == "ipv6" ]] && continue
+                for ((port = start; port <= end; port++)); do
+                    printf 'filter add dev %s protocol ip parent 1: prio %s u32 match ip protocol %s 0xff match ip sport %s 0xffff flowid 1:%s\n' \
+                        "$NIC" "$FILTER_PRIO" "$(proto_number "$proto")" "$port" "$id" >>"$out"
+                done
+            fi
+        done
+    done
+}
+
+build_batch() {
+    local out="$1" i
+    : >"$out"
+
+    printf 'qdisc add dev %s root handle 1: htb default 1 r2q %s\n' \
+        "$NIC" "$R2Q" >>"$out"
+
+    # Guarantee only a little to unmatched traffic, but let it use the whole
+    # link when nothing else needs bandwidth.
+    printf 'class add dev %s parent 1: classid 1:1 htb rate %s ceil %s burst %s cburst %s\n' \
+        "$NIC" "$DEFAULT_GUARANTEE" "$DEFAULT_RATE" \
+        "$(compute_burst "$DEFAULT_RATE")" "$(compute_cburst "$DEFAULT_RATE")" >>"$out"
+
+    for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
+        printf 'class add dev %s parent 1: classid 1:%s htb rate %s ceil %s burst %s cburst %s\n' \
+            "$NIC" "${PLAN_ID[i]}" "${PLAN_RATE[i]}" "${PLAN_RATE[i]}" \
+            "$(compute_burst "${PLAN_RATE[i]}")" "$(compute_cburst "${PLAN_RATE[i]}")" >>"$out"
+
+        if fq_codel_enabled; then
+            printf 'qdisc add dev %s parent 1:%s handle %s: fq_codel%s\n' \
+                "$NIC" "${PLAN_ID[i]}" "${PLAN_ID[i]}" "$FQ_CODEL_OPTS" >>"$out"
+        fi
+
+        emit_filter_cmds "$out" "${PLAN_ID[i]}" "${PLAN_START[i]}" "${PLAN_END[i]}"
+    done
+}
+
+# Every generated command targets $NIC. Run the exact same batch against a
+# throwaway dummy device first, so a syntax error (for example the kernel
+# refusing two protocols on one filter prio) cannot take the live qdisc down.
+precheck_enabled() {
+    case "$PRECHECK" in
+        no) return 1 ;;
+        yes) return 0 ;;
+    esac
+    command -v ip >/dev/null 2>&1 || return 1
+    modinfo -F filename dummy >/dev/null 2>&1
+}
+
+# 0 = ok, 1 = failed, 99 = cannot precheck
+run_precheck() {
+    local batch="$1" dev="lptest0" testbatch rc=0
+    if ip link show dev "$dev" >/dev/null 2>&1; then
+        ip link del "$dev" 2>/dev/null || true
+    fi
+    if ! ip link add "$dev" type dummy 2>/dev/null; then
+        return 99
+    fi
+    ip link set dev "$dev" up 2>/dev/null || true
+
+    testbatch="$(mktemp "${TMPDIR:-/tmp}/limit-ports-pre.XXXXXX")" || {
+        ip link del "$dev" 2>/dev/null || true
+        return 99
+    }
+    sed "s/ dev $NIC / dev $dev /g" "$batch" >"$testbatch"
+
+    if ! tc -batch "$testbatch"; then
+        rc=1
+    fi
+
+    rm -f "$testbatch"
+    tc qdisc del dev "$dev" root 2>/dev/null || true
+    ip link del "$dev" 2>/dev/null || true
+    return "$rc"
+}
+
 apply_rules() {
     validate_config 1
     parse_spec "$SPEC_STRING"
@@ -435,43 +724,44 @@ apply_rules() {
 
     log "规则来源: $SPEC_SOURCE（$(rules_summary)）"
     log_rule_list
+    log "分类器: $(filter_kind_label)   IPv6: $(ipv6_label)   fq_codel: $FQ_CODEL"
+    warn_local_port_conflict
 
     if (( ${#PLAN_ID[@]} == 0 )); then
         log "警告: 没有配置任何限速端口，本次只创建默认队列，等于不做端口限速。"
     fi
 
+    local batch
+    batch="$(mktemp "${TMPDIR:-/tmp}/limit-ports.XXXXXX")" ||
+        die "无法创建临时文件。"
+    build_batch "$batch"
+
+    log "生成 $(wc -l <"$batch") 条 tc 命令，使用 tc -batch 一次性下发。"
+
+    if precheck_enabled; then
+        log "预检: 先在临时 dummy 网卡上试跑同一批命令（$NIC 完全不会被改动）..."
+        local prc=0
+        run_precheck "$batch" || prc=$?
+        if (( prc == 1 )); then
+            rm -f "$batch"
+            die "预检未通过，已放弃下发，$NIC 保持原样。请根据上面的报错修正规则。"
+        elif (( prc == 99 )); then
+            log "预检跳过（无法创建 dummy 网卡）。"
+        else
+            log "预检通过。"
+        fi
+    fi
+
     log "清理 $NIC 上已有的 root qdisc..."
     delete_root_qdisc
 
-    log "创建 HTB 根队列（r2q=$R2Q，默认 class=1:1）..."
-    tc qdisc add dev "$NIC" root handle 1: htb default 1 r2q "$R2Q"
-
-    # Unmatched traffic remains usable instead of being sent to a nonexistent
-    # default class. Set DEFAULT_RATE to the real link rate when needed.
-    tc class add dev "$NIC" parent 1: classid 1:1 htb \
-        rate "$DEFAULT_RATE" ceil "$DEFAULT_RATE"
-
-    local i p
-    for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
-        tc class add dev "$NIC" parent 1: classid "1:${PLAN_ID[i]}" htb \
-            rate "${PLAN_RATE[i]}" ceil "${PLAN_RATE[i]}"
-
-        # Ranges are rejected when they overlap, so every filter can share one
-        # priority chain: cls_u32 hashes on the selector and each source port
-        # lands in its own bucket, which keeps the classification cheap.
-        for ((p = PLAN_START[i]; p <= PLAN_END[i]; p++)); do
-            # Egress packets sent by a listening TCP/UDP service have that
-            # service port as their source port.
-            tc filter add dev "$NIC" protocol ip parent 1: prio "$FILTER_PRIO" u32 \
-                match ip protocol 6 0xff \
-                match ip sport "$p" 0xffff \
-                flowid "1:${PLAN_ID[i]}"
-            tc filter add dev "$NIC" protocol ip parent 1: prio "$FILTER_PRIO" u32 \
-                match ip protocol 17 0xff \
-                match ip sport "$p" 0xffff \
-                flowid "1:${PLAN_ID[i]}"
-        done
-    done
+    if ! tc -batch "$batch"; then
+        rm -f "$batch"
+        log "下发失败，回滚: 删除 root qdisc，回到不限速状态，避免留下半套规则..."
+        delete_root_qdisc
+        die "tc -batch 执行失败，已回滚。"
+    fi
+    rm -f "$batch"
 
     log "完成：${#PLAN_ID[@]} 个 HTB class，$(filter_count) 条 filter。"
     log "查看统计：tc -s class show dev $NIC"
@@ -492,32 +782,16 @@ list_rules() {
     done
 }
 
-print_plan_commands() {
-    printf 'tc qdisc del dev %s root\n' "$NIC"
-    printf 'tc qdisc add dev %s root handle 1: htb default 1 r2q %s\n' "$NIC" "$R2Q"
-    printf 'tc class add dev %s parent 1: classid 1:1 htb rate %s ceil %s\n' \
-        "$NIC" "$DEFAULT_RATE" "$DEFAULT_RATE"
-
-    local i p
-    for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
-        printf 'tc class add dev %s parent 1: classid 1:%s htb rate %s ceil %s\n' \
-            "$NIC" "${PLAN_ID[i]}" "${PLAN_RATE[i]}" "${PLAN_RATE[i]}"
-        for ((p = PLAN_START[i]; p <= PLAN_END[i]; p++)); do
-            printf 'tc filter add dev %s protocol ip parent 1: prio %s u32 match ip protocol 6 0xff match ip sport %s 0xffff flowid 1:%s\n' \
-                "$NIC" "$FILTER_PRIO" "$p" "${PLAN_ID[i]}"
-            printf 'tc filter add dev %s protocol ip parent 1: prio %s u32 match ip protocol 17 0xff match ip sport %s 0xffff flowid 1:%s\n' \
-                "$NIC" "$FILTER_PRIO" "$p" "${PLAN_ID[i]}"
-        done
-    done
-}
-
 plan_rules() {
     validate_config 0
     parse_spec "$SPEC_STRING"
     build_plan
 
-    log "网卡: $NIC   默认速率: $SPEED   默认 class 速率: $DEFAULT_RATE"
+    log "limit_ports.sh $LIMIT_PORTS_VERSION"
+    log "网卡: $NIC   默认速率: $SPEED   默认 class: rate $DEFAULT_GUARANTEE / ceil $DEFAULT_RATE"
     log "规则来源: $SPEC_SOURCE（$(rules_summary)）"
+    log "分类器: $(filter_kind_label)   IPv6: $(ipv6_label)   fq_codel: $FQ_CODEL"
+    warn_local_port_conflict
 
     if (( ${#PLAN_ID[@]} == 0 )); then
         log "当前没有任何限速端口规则。"
@@ -536,14 +810,20 @@ plan_rules() {
         done
     fi
 
-    log "将创建 ${#PLAN_ID[@]} 个 HTB class，$(filter_count) 条 filter。"
+    local batch
+    batch="$(mktemp "${TMPDIR:-/tmp}/limit-ports.XXXXXX")" || die "无法创建临时文件。"
+    build_batch "$batch"
+
+    log "将创建 ${#PLAN_ID[@]} 个 HTB class、$(filter_count) 条 filter，共 $(wc -l <"$batch") 条 tc 命令。"
 
     if (( VERBOSE )); then
-        printf '\n'
-        print_plan_commands
+        printf '\n# 实际执行顺序: tc qdisc del dev %s root  (先清理)\n' "$NIC"
+        cat "$batch"
     else
-        log "加 -v/--verbose 可输出每一条 tc 命令。"
+        log "加 -v/--verbose 输出完整命令。"
     fi
+
+    rm -f "$batch"
 }
 
 stop_rules() {
@@ -561,6 +841,7 @@ status_rules() {
     require_command tc
     require_command ip
     ip link show dev "$NIC" >/dev/null 2>&1 || die "网卡不存在: $NIC"
+    printf 'limit_ports.sh %s\n' "$LIMIT_PORTS_VERSION"
     tc -s qdisc show dev "$NIC"
     tc -s class show dev "$NIC"
 }

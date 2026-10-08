@@ -4,8 +4,13 @@ NIC="eth0"
 # 新规则未指定速率时使用的默认速率。
 SPEED="12mbit"
 
-# Unmatched traffic uses this class. Set it to the actual link capacity.
+# 链路容量（实测值），同时是默认 class 的 ceil。
 DEFAULT_RATE="1000mbit"
+
+# 未匹配流量（不在 PORT_SPEC 里的端口）的"保证"速率。
+# HTB 的 rate 是保证带宽，不是上限：默认 class 只需要保证一点，
+# 空闲时它仍然可以 burst 到 DEFAULT_RATE。默认 1mbit。
+DEFAULT_GUARANTEE="1mbit"
 
 # 需要限速的端口，语法: PORT[-END][=RATE][@per-port|@shared]
 #   8080                        单端口，使用上面的 SPEED
@@ -21,3 +26,26 @@ PORT_SPEC="10001-10200=12mbit"
 
 CLASS_START="10"
 R2Q="100"
+
+# ---- 一般不需要改 ----
+# auto | flower | u32   flower 支持端口区间和 IPv6；u32 只支持 IPv4 且需逐端口。
+# 内核不支持 flower 时会自动回退。
+# FILTER_KIND="auto"
+
+# auto | yes | no   是否同时对 IPv6 限速，auto = 网卡有全局 IPv6 地址时才启用。
+# IPV6_MODE="auto"
+
+# IPv4 与 IPv6 必须使用不同的 filter prio，否则内核会返回 ENOENT。
+# FILTER_PRIO="10"
+# FILTER_PRIO6="11"
+
+# 每个限速 class 下面挂 fq_codel，避免限速后延迟飙升。
+# FQ_CODEL="yes"
+# FQ_CODEL_OPTS=" flows 256 limit 1024"
+
+# 下发前先在临时 dummy 网卡上试跑整批命令，失败就不碰真实网卡。
+# PRECHECK="auto"
+
+# burst / cburst 留空表示按速率自动计算。
+# BURST=""
+# CBURST=""

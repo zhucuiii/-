@@ -230,6 +230,32 @@ sudo /usr/local/sbin/portctl.sh firewall-clear     # 移除本程序创建的链
 - 系统没有 `journald` 时会自动回退到 `/var/log/syslog` 或 `/var/log/messages`（按关键字过滤），
   两者都没有就明确提示找不到日志来源。
 
+## 限速实现细节
+
+`limit_ports.sh` 的工作原理，以及几条容易被忽略的边界：
+
+- **分类器用 `flower`，同时覆盖 IPv4 和 IPv6**。旧版用 `u32` + `protocol ip`，**IPv6 包不匹配任何 filter，会落到默认队列，等于完全绕过了限速**（实测 IPv6 能跑满链路）。
+  `flower` 还支持端口区间，`@shared` 模式下整个区间只需要一条 filter。内核没有 `flower` 时自动回退到 `u32`（此时只有 IPv4 受控，日志里会明确提示）。
+- **IPv4 和 IPv6 必须用不同的 filter `prio`**。同一个 parent 下两个协议族共用一个 prio，内核会返回
+  `Filter with specified priority/protocol not found`。默认 `FILTER_PRIO=10`（IPv4）、`FILTER_PRIO6=11`（IPv6）。
+- **默认 class 只保证很小的带宽**（`DEFAULT_GUARANTEE`，默认 `1mbit`），`ceil` 才是链路容量（`DEFAULT_RATE`）。
+  HTB 的 `rate` 是**保证**带宽而不是上限，所以旧写法把 `rate` 和 `ceil` 都设成链路容量是不准确的；
+  空闲时默认 class 仍然可以 burst 到 `DEFAULT_RATE`。
+- **每个限速 class 下面挂 `fq_codel`**。否则叶子队列是纯 FIFO，限速一开延迟就飙（bufferbloat）。
+- **显式设置 `burst`/`cburst`**。不设置时 tc 用的是刚好卡在最小值的默认值，实测速率会略低于配置值；
+  留空则按 `rate` 自动计算（一个调度 tick 的发送量），也可以用 `BURST`/`CBURST` 覆盖。
+- **整批命令用一次 `tc -batch` 下发**。旧版是每端口、每规则各调一次 `tc`（200 个端口约 600~1000 次进程调用），
+  现在是 1 次。失败时会**删除 root qdisc 回滚**，回到"不限速"而不是留下半套规则。
+- **下发前先在临时 `dummy` 网卡上试跑同一批命令**（`PRECHECK`，默认 `auto`）。预检不通过就直接放弃，
+  真实网卡**完全不会被碰**，现有队列保持原样。
+- **端口区间不要和内核临时端口范围重叠**。服务器自己的出站连接源端口取自
+  `net.ipv4.ip_local_port_range`，如果和限速区间重叠，这些无关连接会被一起限速。
+  脚本检测到重叠时会打印提示，建议收窄为 `32768 60999`：
+
+  ```bash
+  sysctl -w net.ipv4.ip_local_port_range="32768 60999"
+  ```
+
 ## 说明
 
 - 当前规则塑形的是出口流量，使用服务端 TCP/UDP 源端口匹配。
