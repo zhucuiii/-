@@ -27,6 +27,8 @@ jobs:
         run: bash tests/reliability.sh
       - name: Installer regression tests
         run: bash tests/install.sh
+      - name: Optimization regression tests
+        run: bash tests/optimizations.sh
       - name: Install network test dependencies
         run: |
           sudo apt-get update

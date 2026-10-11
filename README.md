@@ -101,6 +101,10 @@ sudo /usr/local/sbin/limit_ports.sh stats          # 每个端口的字节/包�
 sudo /usr/local/sbin/limit_ports.sh plan -v        # 只打印将要执行的 tc 命令
 sudo /usr/local/sbin/limit_ports.sh status
 sudo /usr/local/sbin/limit_ports.sh stop
+sudo /usr/local/sbin/limit_ports.sh config-state     # applied / pending / unknown
+sudo /usr/local/sbin/limit_ports.sh effective-rates  # 从实际队列读取生效速率
+sudo /usr/local/sbin/limit_ports.sh capacity         # 队列和统计容量
+sudo /usr/local/sbin/limit_ports.sh check            # 校验配置
 ```
 
 `rules`、`stats` 和 `plan` 是只读动作，不需要 root，可以用来确认配置是否正确。
@@ -145,6 +149,12 @@ sudo ./portctl.sh
 - 高级与排障包含 tc 队列统计、只读执行计划、清空全部规则。清空必须输入 `YES` 确认。
 - 菜单写入的规则会保存回 `/etc/default/limit-ports`，原来的注释和 `NIC`、`DEFAULT_RATE` 等配置不变。
 - 新规则如果和已有规则端口重叠，会提示将被替换的规则并要求确认。
+- 保存规则使用配置锁、原版本校验和同目录原子替换。其他 SSH 会话修改过配置时，
+  本次保存会拒绝覆盖并提示刷新；无效候选配置不会替换旧文件。
+- 主菜单显示配置是否已应用，规则表分别显示基础速率和从内核读取的生效速率。
+  生效版本保存在 `/var/lib/portctl/limits/`；保存了新规则但尚未应用时，策略不会把新端口映射到旧队列。
+- 限速默认最多 4096 个队列，逐端口统计默认最多 512 个端口（`MAX_CLASSES` / `ACCT_MAX_PORTS`）。
+  超过统计容量的大区间仍可限速和使用时段策略，月额度与用量降速会提前提示不可用。
 
 ### 02 流量查看
 
@@ -293,6 +303,11 @@ deny all all from 198.51.100.0/24
   （只在下发时生效，不写入配置文件）。
 - **开机自动恢复**：在后端与开机自启设置里开启后会生成 `portctl-firewall.service`（`ExecStart` 调 `portctl.sh firewall-apply`，
   `ExecStop` 调 `firewall-clear`），不依赖 `iptables-persistent` 之类的额外软件包。
+- **整份校验**：错误端口、缺失字段、额外字段和错误后端设置会拒绝整份配置，不再忽略错误行后部分下发。
+  防火墙保存也会检查原版本并原子替换，菜单确认后配置发生变化会拒绝下发。
+- **统一 SSH 防护**：菜单、命令行和开机恢复都经过同一个下发检查。
+  命令行确实需要覆盖 SSH 防护时使用 `firewall-apply --force`；持久配置可显式设为 `ssh-protect no`。
+  开机时没有当前客户端 IP，来源受限的临时 SSH 放行规则不能视为永久保护。
 
 不开菜单也可以直接用命令行：
 
@@ -363,8 +378,19 @@ sudo /usr/local/sbin/portctl.sh firewall-clear     # 移除本程序创建的链
 - 策略只绑定基础规则的完整端口范围；基础规则范围变化后会提示重新设置策略。
 - 独立区间策略会更新区间内的每个队列，共享区间更新一个队列；有效速率未变化时不重复调用 `tc -batch`。
 - `apply`、`rate-set` 和 `stop` 使用同一网卡锁，菜单操作与定时策略不会同时修改该网卡。
+- 速率换算、队列比较及 burst 计算按批次处理并缓存相同速率；
+  200 个速率未变化的独立队列检查只需常数次数的 `awk` 调用。
+- 开启用量策略自动执行时，会启用基础限速服务和流量统计恢复，生成
+  `limit-ports.service → portctl-accounting.service → portctl-policy.service` 的依赖顺序。
+  纯时段策略只依赖基础限速服务，不受流量统计容量限制。
+- 策略执行会恢复缺失的统计表；查看状态不会自动改动内核规则。
+  页面显示实际生效速率、剩余额度、解除时间和最近执行结果，执行记录保存在
+  `/var/lib/portctl/policy/last-run.tsv`。
 - 配置保存在 `/etc/default/portctl-policy.tsv`，运行状态保存在 `/var/lib/portctl/policy/state.tsv`。
 - `portctl-policy.timer` 每分钟执行一次，也可以手动执行刷新。
+
+从旧版升级后，请先在「端口限速」中应用一次当前配置，以建立生效版本记录；
+已经开启策略自启的用户，再选择一次「开启自动执行」，更新 systemd 依赖。
 
 ## 回归测试
 
@@ -377,6 +403,7 @@ bash tests/menus.sh
 bash tests/policy.sh
 bash tests/reliability.sh
 bash tests/install.sh
+bash tests/optimizations.sh
 ```
 
 菜单测试使用模拟命令检查导航、服务操作和日志入口，并在临时目录验证规则编辑及危险操作取消。

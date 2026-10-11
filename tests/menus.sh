@@ -55,7 +55,8 @@ check_route() (
     limit_root() { record "limit:$*"; }
     limit_local() {
         case "$1" in
-            rules) : ;;
+            rules|effective-rates) : ;;
+            config-state) printf 'unknown\n' ;;
             *) record "limit-local:$*" ;;
         esac
     }
@@ -144,6 +145,12 @@ pass "cancelling add and rate input returns successfully under errexit"
 
 # Exercise actual config writes, isolated to the temporary directory.
 run_root() { "$@"; }
+limit_root() (
+    source <(sed '$d' "$LIMIT_SCRIPT")
+    require_root() { :; }
+    LIMIT_SELF="$LIMIT_SCRIPT"
+    main "$@"
+)
 printf '# preserved\nNIC="eth0"\nSPEED="12mbit"\nPORT_SPEC="8080=12mbit 9000-9002=30mbit@shared"\n' >"$CONFIG_FILE"
 change_rule_rate <<<$'1\n25\n1\nn' >"$TMP/out" 2>"$TMP/err"
 CONFIG_FILE="$CONFIG_FILE" bash "$LIMIT_SCRIPT" rules >"$TMP/rules"

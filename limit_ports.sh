@@ -46,13 +46,23 @@
 #
 set -Eeuo pipefail
 
-LIMIT_PORTS_VERSION="0.6.1"
+LIMIT_PORTS_VERSION="0.7.0"
 
 CONFIG_FILE="${CONFIG_FILE:-/etc/default/limit-ports}"
+config_version() {
+    if [[ -f "$CONFIG_FILE" ]]; then cksum <"$CONFIG_FILE"; else printf 'missing\n'; fi
+}
+LOADED_CONFIG_VERSION="$(config_version)"
 if [[ -r "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
 fi
+[[ "$(config_version)" == "$LOADED_CONFIG_VERSION" ]] || {
+    printf '[limit-ports] 配置读取期间发生变化，请重试。\n' >&2
+    exit 1
+}
+LIMIT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+LIMIT_STATE_DIR="${LIMIT_STATE_DIR:-/var/lib/portctl/limits}"
 
 NIC="${NIC:-eth0}"
 SPEED="${SPEED:-12mbit}"
@@ -86,6 +96,8 @@ CBURST="${CBURST:-}"
 ACTION="apply"
 ACTION_SPEC=""
 RATE_FILE=""
+CONFIG_SOURCE=""
+EXPECTED_VERSION=""
 SPEC_STRING=""
 SPEC_SOURCE="config"
 START_PORT_GIVEN=0
@@ -104,6 +116,7 @@ PLAN_RATE=()
 PLAN_START=()
 PLAN_END=()
 PLAN_RULE=()
+declare -A RATE_BPS=() RATE_BURST=() RATE_CBURST=()
 
 log() {
     printf '[limit-ports] %s\n' "$*"
@@ -117,7 +130,7 @@ die() {
 usage() {
     cat <<'USAGE'
 用法:
-  limit_ports.sh [apply|stop|status|rules|stats|plan] [选项]
+  limit_ports.sh [apply|stop|status|rules|stats|plan|rate-set|config-state|effective-rates|capacity|check] [选项]
 
 动作:
   apply        应用限速规则（默认动作）
@@ -126,6 +139,11 @@ usage() {
   rules        打印解析后的限速规则（只读，不改动系统）
   stats        打印每个限速端口的字节/包计数（只读，供流量统计用）
   plan         打印将要执行的 tc 命令（只读，加 -v 输出完整 batch）
+  config-state 显示当前配置是否已应用（只读）
+  effective-rates 读取实际生效的队列速率（只读）
+  capacity     显示端口数量、队列数量和统计容量（只读）
+  check        校验配置与容量（只读）
+  rate-set     更新已应用配置对应的队列速率
 
 选项:
   --nic IFACE              网卡，默认 eth0
@@ -135,6 +153,8 @@ usage() {
   --start-port PORT        起始端口（兼容旧配置）
   --end-port PORT          结束端口（兼容旧配置）
   --r2q NUMBER             HTB r2q 参数
+  --rate-file FILE         速率覆盖 TSV
+  --expected-version TEXT  拒绝与指定配置版本不一致的更新
   -v, --verbose            plan 时输出完整命令
   -h, --help               显示帮助
 
@@ -164,7 +184,7 @@ require_option_value() {
 parse_args() {
     while (($# > 0)); do
         case "$1" in
-            apply|stop|status|rules|stats|plan|rate-set)
+            apply|stop|status|rules|stats|plan|rate-set|config-save|config-state|check|effective-rates|capacity)
                 ACTION="$1"
                 shift
                 ;;
@@ -210,6 +230,10 @@ parse_args() {
                 RATE_FILE="$2"
                 shift 2
                 ;;
+            --config-source)
+                require_option_value "$@"; CONFIG_SOURCE="$2"; shift 2 ;;
+            --expected-version)
+                require_option_value "$@"; EXPECTED_VERSION="$2"; shift 2 ;;
             -v|--verbose)
                 VERBOSE=1
                 shift
@@ -267,6 +291,7 @@ mode_label() {
 
 rate_to_bps() {
     local rate="${1,,}"
+    if [[ -n "${RATE_BPS[$rate]:-}" ]]; then printf '%s' "${RATE_BPS[$rate]}"; return; fi
     case "$rate" in
         *tbit) awk "BEGIN { printf \"%.0f\", ${rate%tbit} * 1000000000000 }" ;;
         *gbit) awk "BEGIN { printf \"%.0f\", ${rate%gbit} * 1000000000 }" ;;
@@ -277,6 +302,29 @@ rate_to_bps() {
     esac
 }
 
+cache_rates() {
+    local rate out bps burst cburst
+    local -a missing=()
+    for rate in "$@"; do
+        rate="${rate,,}"
+        [[ -n "${RATE_BPS[$rate]:-}" ]] || missing+=("$rate")
+    done
+    (( ${#missing[@]} )) || return 0
+    out="$(printf '%s\n' "${missing[@]}" | LC_ALL=C awk '
+        function bps(r, n,u) {
+            n=r+0; u=r; sub(/^[0-9]+([.][0-9]+)?/,"",u)
+            return n * (u=="tbit"?1e12:u=="gbit"?1e9:u=="mbit"?1e6:u=="kbit"?1e3:1)
+        }
+        !seen[$0]++ {
+            n=bps($0); b=n/400; c=n/800
+            printf "%s\t%.0f\t%.0f\t%.0f\n",$0,n,b<3000?3000:b,c<1500?1500:c
+        }
+    ')" || return 1
+    while IFS=$'\t' read -r rate bps burst cburst; do
+        RATE_BPS["$rate"]="$bps" RATE_BURST["$rate"]="$burst" RATE_CBURST["$rate"]="$cburst"
+    done <<<"$out"
+}
+
 # HTB needs a burst large enough to cover one scheduling tick, otherwise the
 # configured rate cannot actually be reached (see tc-htb(8) NOTES).
 compute_burst() {
@@ -284,6 +332,7 @@ compute_burst() {
         printf '%s' "$BURST"
         return 0
     fi
+    if [[ -n "${RATE_BURST[$1]:-}" ]]; then printf '%s' "${RATE_BURST[$1]}"; return; fi
     local bps
     bps="$(rate_to_bps "$1")" || {
         printf '15000'
@@ -302,6 +351,7 @@ compute_cburst() {
         printf '%s' "$CBURST"
         return 0
     fi
+    if [[ -n "${RATE_CBURST[$1]:-}" ]]; then printf '%s' "${RATE_CBURST[$1]}"; return; fi
     local bps
     bps="$(rate_to_bps "$1")" || {
         printf '3000'
@@ -515,6 +565,86 @@ build_plan() {
         (( classes <= MAX_CLASSES )) ||
             die "需要创建 $classes 个 HTB class，超过 MAX_CLASSES=$MAX_CLASSES。请改用区间共享限速（@shared）或缩小端口区间。"
     fi
+    cache_rates "$DEFAULT_RATE" "$DEFAULT_GUARANTEE" "${PARSE_RATE[@]}"
+}
+
+base_signature() {
+    {
+        printf '%s\n' "$NIC" "$CLASS_START" "$R2Q" "$DEFAULT_RATE" "$DEFAULT_GUARANTEE" \
+            "$FILTER_KIND" "$IPV6_MODE" "$FILTER_PRIO" "$FILTER_PRIO6" "$FQ_CODEL" "$FQ_CODEL_OPTS" "$BURST" "$CBURST"
+        cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf 'unknown\n'
+        local i
+        for ((i=0;i<${#PARSE_START[@]};i++)); do
+            printf '%s\t%s\t%s\t%s\n' "${PARSE_START[i]}" "${PARSE_END[i]}" "${PARSE_RATE[i]}" "${PARSE_MODE[i]}"
+        done
+    } | cksum
+}
+
+applied_state_file() { printf '%s/%s.applied' "$LIMIT_STATE_DIR" "${NIC//\//_}"; }
+
+config_state() {
+    local signature saved file
+    signature="$(base_signature)" || return 1
+    file="$(applied_state_file)"
+    if [[ ! -r "$file" ]]; then printf 'unknown\n'; return; fi
+    saved="$(cat "$file")" || return 1
+    if [[ "$saved" == "$signature" ]]; then printf 'applied\n'; else printf 'pending\n'; fi
+}
+
+require_applied_config() {
+    [[ "$(config_state)" == applied ]] ||
+        die "配置尚未应用或生效版本无法确认，请先应用基础规则。"
+}
+
+class_rates() {
+    local current
+    current="$(LC_ALL=C tc class show dev "$NIC")" || return 1
+    printf '%s\n' "$current" | LC_ALL=C awk '
+        function bps(r,n,u) {
+            r=tolower(r); n=r+0; u=r; sub(/^[0-9]+([.][0-9]+)?/,"",u)
+            if(u!="bit" && u!="kbit" && u!="mbit" && u!="gbit" && u!="tbit") return -1
+            return n * (u=="tbit"?1e12:u=="gbit"?1e9:u=="mbit"?1e6:u=="kbit"?1e3:1)
+        }
+        $1=="class" && $2=="htb" {
+            r=""; c=""
+            for(i=4;i<NF;i++) {if($i=="rate") r=$(i+1); if($i=="ceil") c=$(i+1)}
+            if(r!="" && c!="") printf "%s\t%.0f\t%.0f\t%s\n",$3,bps(r),bps(c),tolower(c)
+        }
+    '
+}
+
+effective_rates() {
+    local rows id rate ceil display i key
+    require_command tc
+    require_applied_config
+    rows="$(class_rates)" || die "无法读取当前队列。"
+    local -A actual=() value=()
+    while IFS=$'\t' read -r id rate ceil display; do
+        [[ -n "$id" ]] || continue
+        actual["$id"]="$display" value["$id"]="$ceil"
+    done <<<"$rows"
+    local -A result=() numeric=()
+    for ((i=0;i<${#PLAN_ID[@]};i++)); do
+        key="${PLAN_RULE[i]}" id="1:${PLAN_ID[i]}"
+        if [[ -z "${actual[$id]:-}" || "${value[$id]:--1}" == -1 ]]; then
+            result["$key"]=missing; continue
+        fi
+        [[ "${result[$key]:-}" != missing ]] || continue
+        if [[ -n "${numeric[$key]:-}" && "${numeric[$key]}" != "${value[$id]}" ]]; then
+            result["$key"]=mixed
+        elif [[ "${result[$key]:-}" != missing && "${result[$key]:-}" != mixed ]]; then
+            result["$key"]="${actual[$id]}"
+        fi
+        numeric["$key"]="${value[$id]}"
+    done
+    for ((i=0;i<${#PARSE_START[@]};i++)); do
+        printf '%s\t%s\t%s\n' "${PARSE_START[i]}" "${PARSE_END[i]}" "${result[$i]:-missing}"
+    done
+}
+
+capacity_report() {
+    printf 'ports\t%s\nclasses\t%s\nclass_limit\t%s\naccounting_limit\t%s\n' \
+        "$(total_ports)" "${#PLAN_ID[@]}" "$MAX_CLASSES" "${ACCT_MAX_PORTS:-512}"
 }
 
 filter_count() {
@@ -537,6 +667,8 @@ validate_config() {
     local check_nic="${1:-1}"
 
     [[ -n "$NIC" ]] || die "NIC 不能为空。"
+    [[ "${ACCT_MAX_PORTS:-512}" =~ ^[1-9][0-9]{0,4}$ ]] &&
+        (( ${ACCT_MAX_PORTS:-512} <= 65535 )) || die "ACCT_MAX_PORTS 必须是 1-65535。"
     is_uint "$CLASS_START" || die "CLASS_START 必须是整数。"
     is_uint "$R2Q" || die "R2Q 必须是整数。"
     is_uint "$MAX_CLASSES" || die "MAX_CLASSES 必须是整数。"
@@ -764,16 +896,25 @@ apply_rules() {
         fi
     fi
 
+    local state pending
+    state="$(applied_state_file)"
+    install -d -m 0755 "$LIMIT_STATE_DIR" || die "无法创建生效状态目录。"
+    pending="$(mktemp "$LIMIT_STATE_DIR/.applied.XXXXXX")" || die "无法创建生效状态文件。"
+    base_signature >"$pending" || die "无法记录配置版本。"
+    chmod 0644 "$pending"
+    rm -f "$state"
     log "清理 $NIC 上已有的 root qdisc..."
     delete_root_qdisc
 
     if ! tc -batch "$batch"; then
         rm -f "$batch"
+        rm -f "$pending"
         log "下发失败，回滚: 删除 root qdisc，回到不限速状态，避免留下半套规则..."
         delete_root_qdisc
         die "tc -batch 执行失败，已回滚。"
     fi
     rm -f "$batch"
+    mv -f "$pending" "$state" || die "队列已应用，但生效状态保存失败，请重试。"
 
     log "完成：${#PLAN_ID[@]} 个 HTB class，$(filter_count) 条 filter。"
     log "查看统计：tc -s class show dev $NIC"
@@ -782,10 +923,13 @@ apply_rules() {
 rate_set() {
     require_root
     require_command tc
+    [[ -z "$EXPECTED_VERSION" || "$LOADED_CONFIG_VERSION" == "$EXPECTED_VERSION" ]] ||
+        die "配置已被其他会话修改，未更新策略速率，请刷新后重试。"
     [[ -r "$RATE_FILE" ]] || die "找不到速率覆盖文件: $RATE_FILE"
     validate_config 1
     parse_spec "$SPEC_STRING"
     build_plan
+    require_applied_config
 
     local -A override=() current_rate=() current_ceil=() desired_bps=()
     local start end rate key i batch extra rule matched current id ceil commands=0
@@ -807,24 +951,17 @@ rate_set() {
         done
         (( matched )) || die "速率覆盖未匹配基础规则: $key"
         override["$key"]="$rate"
-        desired_bps["$key"]="$(rate_to_bps "$rate")"
     done <"$RATE_FILE"
+    cache_rates "${override[@]}"
+    for key in "${!override[@]}"; do desired_bps["$key"]="${RATE_BPS[${override[$key]}]}"; done
 
     (( ${#override[@]} )) || die "速率覆盖文件没有匹配当前基础规则。"
-    current="$(tc class show dev "$NIC")" || die "无法读取当前限速队列。"
-    while read -r id rate ceil; do
+    current="$(class_rates)" || die "无法读取当前限速队列。"
+    local display
+    while IFS=$'\t' read -r id rate ceil display; do
         [[ -n "$id" ]] || continue
-        current_rate["$id"]="${rate,,}" current_ceil["$id"]="${ceil,,}"
-    done < <(awk '
-        $1=="class" && $2=="htb" {
-            rate=""; ceil=""
-            for(i=4;i<NF;i++) {
-                if($i=="rate") rate=$(i+1)
-                if($i=="ceil") ceil=$(i+1)
-            }
-            if(rate!="" && ceil!="") print $3,rate,ceil
-        }
-    ' <<<"$current")
+        current_rate["$id"]="$rate" current_ceil["$id"]="$ceil"
+    done <<<"$current"
     batch="$(mktemp "${TMPDIR:-/tmp}/limit-ports-rate.XXXXXX")" || die "无法创建临时文件。"
     : >"$batch"
     for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
@@ -837,8 +974,8 @@ rate_set() {
                 rm -f "$batch"
                 die "缺少限速队列 $id，请先应用基础规则。"
             fi
-            if [[ "$(rate_to_bps "${current_rate[$id]}")" == "${desired_bps[$key]}" &&
-                  "$(rate_to_bps "${current_ceil[$id]}")" == "${desired_bps[$key]}" ]]; then
+            if [[ "${current_rate[$id]}" == "${desired_bps[$key]}" &&
+                  "${current_ceil[$id]}" == "${desired_bps[$key]}" ]]; then
                 continue
             fi
             printf 'class change dev %s parent 1: classid 1:%s htb rate %s ceil %s burst %s cburst %s\n' \
@@ -961,6 +1098,7 @@ stop_rules() {
     ip link show dev "$NIC" >/dev/null 2>&1 || die "网卡不存在: $NIC"
     log "删除 $NIC 的 root qdisc..."
     delete_root_qdisc
+    rm -f "$(applied_state_file)"
     log "已停止。"
 }
 
@@ -993,6 +1131,36 @@ with_nic_lock() (
     "$@"
 )
 
+with_config_lock() (
+    local dir="${CONFIG_FILE}.lock.d" attempt=0
+    if command -v flock >/dev/null 2>&1; then
+        exec {config_lock_fd}>"${CONFIG_FILE}.lock" || exit 1
+        flock -w 30 "$config_lock_fd" || die "配置正在更新，请稍后重试。"
+    else
+        while ! mkdir "$dir" 2>/dev/null; do
+            attempt=$((attempt + 1)); (( attempt < 300 )) || die "配置正在更新，请稍后重试。"
+            sleep 0.1
+        done
+        trap 'rmdir "$dir"' EXIT
+    fi
+    [[ "$(config_version)" == "$LOADED_CONFIG_VERSION" ]] || die "配置已被其他会话修改，请刷新后重试。"
+    [[ -z "$EXPECTED_VERSION" || "$LOADED_CONFIG_VERSION" == "$EXPECTED_VERSION" ]] ||
+        die "配置已被其他会话修改，请刷新后重试。"
+    "$@"
+)
+
+save_config() {
+    [[ -r "$CONFIG_SOURCE" && -n "$EXPECTED_VERSION" ]] || die "需要候选配置和原配置版本。"
+    [[ "$(config_version)" == "$EXPECTED_VERSION" ]] || die "配置已被其他会话修改，请刷新后重试。"
+    bash -n "$CONFIG_SOURCE" || die "候选配置语法无效。"
+    CONFIG_FILE="$CONFIG_SOURCE" bash "$LIMIT_SELF" check || die "候选配置校验失败。"
+    local tmp
+    tmp="$(mktemp "$(dirname -- "$CONFIG_FILE")/.limit-ports.XXXXXX")" || die "无法创建临时配置。"
+    if ! install -m 0644 "$CONFIG_SOURCE" "$tmp" || ! mv -fT "$tmp" "$CONFIG_FILE"; then
+        rm -f "$tmp"; die "保存配置失败，旧配置保留。"
+    fi
+}
+
 main() {
     parse_args "$@"
 
@@ -1002,14 +1170,14 @@ main() {
             require_command tc
             require_command ip
             resolve_spec
-            with_nic_lock apply_rules
+            with_config_lock with_nic_lock apply_rules
             ;;
         stop)
             require_root
             require_command tc
             require_command ip
             resolve_spec
-            with_nic_lock stop_rules
+            with_config_lock with_nic_lock stop_rules
             ;;
         status)
             require_root
@@ -1037,7 +1205,29 @@ main() {
             require_root
             [[ -n "$RATE_FILE" ]] || die "rate-set 需要 --rate-file。"
             resolve_spec
-            with_nic_lock rate_set
+            with_config_lock with_nic_lock rate_set
+            ;;
+        config-save)
+            require_root
+            with_config_lock save_config
+            ;;
+        config-state|effective-rates|capacity|check)
+            resolve_spec
+            validate_config 0
+            parse_spec "$SPEC_STRING"
+            build_plan
+            case "$ACTION" in
+                config-state) config_state ;;
+                effective-rates) effective_rates ;;
+                capacity) capacity_report ;;
+                check)
+                    local count
+                    count="$(total_ports)"
+                    if (( count > ${ACCT_MAX_PORTS:-512} )); then
+                        log "当前 $count 个端口可限速，但超过流量统计上限 ${ACCT_MAX_PORTS:-512}；用量策略不可用。"
+                    fi
+                    ;;
+            esac
             ;;
         *)
             die "用法: $0 {apply|stop|status|rules|stats|plan}"

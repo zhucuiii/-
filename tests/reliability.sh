@@ -41,6 +41,7 @@ pass "firewall lifecycle stays independent and uninstall removes policy componen
 (
     source <(sed '$d' "$ROOT/limit_ports.sh")
     require_root() { :; }
+    config_state() { printf 'applied\n'; }
     ip() { return 0; }
     tc() {
         case "$*" in

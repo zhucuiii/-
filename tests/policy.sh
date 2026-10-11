@@ -60,6 +60,11 @@ grep -q $'^8080\t8080\t10mbit' <<<"$POLICY_EFFECTIVE" ||
 grep -q $'^9000\t9002\t5mbit' <<<"$POLICY_EFFECTIVE" ||
     fail "usage effective rate missing"
 pass "usage and monthly policies choose the strictest active rate"
+[[ "${POLICY_REMAINING[8080-8080]}" == 0 && "${POLICY_REMAINING[9000-9002]}" == 0 ]] ||
+    fail "remaining quota was not clamped at zero"
+[[ "${POLICY_RELEASES[8080-8080]}" == *下月1日* &&
+   "${POLICY_RELEASES[9000-9002]}" == 手动解除 ]] || fail "release information is missing"
+pass "status exposes remaining quotas and release conditions for active policies"
 
 cat >"$POLICY_CONF" <<'EOF'
 1	schedule	8080	8080	0	20mbit	00:00	23:59

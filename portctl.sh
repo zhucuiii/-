@@ -58,6 +58,11 @@ RULE_RATE=()
 RULE_MODE=()
 RULE_PORTS=()
 RULES_ERROR=""
+RULES_VERSION="missing"
+
+config_version() {
+    if [[ -f "$CONFIG_FILE" ]]; then cksum <"$CONFIG_FILE"; else printf 'missing\n'; fi
+}
 
 cleanup() {
     # 非交互调用（systemd / 命令行）时不要往 stdout 写转义序列。
@@ -160,7 +165,7 @@ pad() {
 
 draw_brand() {
     printf '%s%sPORT//CTL%s\n' "$CYAN" "$BOLD" "$RESET"
-    printf '%sSSH 服务器端口控制台  v0.8.0%s\n' "$DIM" "$RESET"
+    printf '%sSSH 服务器端口控制台  v0.9.0%s\n' "$DIM" "$RESET"
 }
 
 draw_status() {
@@ -169,6 +174,17 @@ draw_status() {
     printf '\n%s主机:%s %s\n' "$DIM" "$RESET" "$host"
     printf '%s网卡:%s %s    %s默认速率:%s %s (%s)\n' \
         "$DIM" "$RESET" "$NIC" "$DIM" "$RESET" "$SPEED" "$(current_rate_mb "$SPEED")"
+    show_config_state
+}
+
+show_config_state() {
+    local state
+    state="$(limit_local config-state 2>/dev/null)" || state=unknown
+    case "$state" in
+        applied) printf '配置状态: 已应用\n' ;;
+        pending) printf '配置状态: 有未应用的修改\n' ;;
+        *) printf '配置状态: 尚未应用或无法确认\n' ;;
+    esac
 }
 
 draw_menu() {
@@ -195,6 +211,7 @@ load_rules() {
     RULE_MODE=()
     RULE_PORTS=()
     RULES_ERROR=""
+    RULES_VERSION="$(config_version)" || return 1
 
     # Without a config file nothing is configured. Do not fall back to
     # limit_ports.sh's built-in default range, which the user never chose.
@@ -205,6 +222,10 @@ load_rules() {
     local out line idx start end rate mode ports
     if ! out="$(limit_local rules 2>&1)"; then
         RULES_ERROR="$out"
+        return 1
+    fi
+    if [[ "$(config_version)" != "$RULES_VERSION" ]]; then
+        RULES_ERROR="配置已被其他会话修改，请刷新后重试。"
         return 1
     fi
 
@@ -230,18 +251,31 @@ print_rules_table() {
         return 0
     fi
 
-    local i total=0 row
-    row="  $(pad '编号' 6) $(pad '端口' 18) $(pad '速率' 12) $(pad '方式' 12) 端口数"
+    local i total=0 row actual_data start end actual key
+    local -A actual_rates=()
+    actual_data="$(limit_local effective-rates 2>/dev/null)" || actual_data=""
+    while IFS=$'\t' read -r start end actual; do
+        [[ -n "$start" ]] || continue
+        actual_rates["$start-$end"]="$actual"
+    done <<<"$actual_data"
+    row="  $(pad '编号' 6) $(pad '端口' 18) $(pad '基础速率' 12) $(pad '生效速率' 12) $(pad '方式' 12) 端口数"
     printf '%s%s%s\n' "$DIM" "$row" "$RESET"
 
     for ((i = 0; i < ${#RULE_IDX[@]}; i++)); do
         total=$((total + RULE_PORTS[i]))
-        row="  $(pad "${RULE_IDX[i]}" 6) $(pad "$(port_range_label "${RULE_START[i]}" "${RULE_END[i]}")" 18) $(pad "${RULE_RATE[i]}" 12) $(pad "$(mode_label "${RULE_MODE[i]}")" 12) ${RULE_PORTS[i]}"
+        key="${RULE_START[i]}-${RULE_END[i]}"
+        actual="${actual_rates[$key]:-未确认}"
+        case "$actual" in missing) actual="队列缺失" ;; mixed) actual="混合速率" ;; esac
+        row="  $(pad "${RULE_IDX[i]}" 6) $(pad "$(port_range_label "${RULE_START[i]}" "${RULE_END[i]}")" 18) $(pad "${RULE_RATE[i]}" 12) $(pad "$actual" 12) $(pad "$(mode_label "${RULE_MODE[i]}")" 12) ${RULE_PORTS[i]}"
         printf '%s%s%s\n' "$CYAN" "$row" "$RESET"
     done
 
     printf '%s  合计: %s 条规则 / %s 个端口%s\n' \
         "$DIM" "${#RULE_IDX[@]}" "$total" "$RESET"
+    printf '  容量: 限速 %s 队列 / 流量统计 %s 端口\n' "${MAX_CLASSES:-4096}" "$ACCT_MAX_PORTS"
+    if (( total > ACCT_MAX_PORTS )); then
+        printf '  当前端口超过统计容量，可限速；月额度和用量降速不可用。\n'
+    fi
 }
 
 print_rule_by_index() {
@@ -356,7 +390,7 @@ config_apply_edits() {
     ' "$tmp" >"$stage"
     mv -f "$stage" "$tmp"
 
-    if ! run_root install -m 0644 "$tmp" "$CONFIG_FILE"; then
+    if ! limit_root config-save --config-source "$tmp" --expected-version "$RULES_VERSION"; then
         rm -f "$tmp"
         printf '%s写入配置失败: %s%s\n' "$RED" "$CONFIG_FILE" "$RESET"
         return 1
@@ -1105,6 +1139,18 @@ acct_ports() {
     return 0
 }
 
+acct_capacity_check() {
+    local total=0 i
+    [[ "$ACCT_MAX_PORTS" =~ ^[1-9][0-9]{0,4}$ ]] && (( ACCT_MAX_PORTS <= 65535 )) || {
+        printf '[acct] ACCT_MAX_PORTS 必须是 1-65535。\n' >&2; return 1;
+    }
+    for ((i=0;i<${#RULE_IDX[@]};i++)); do total=$((total + RULE_PORTS[i])); done
+    (( total <= ACCT_MAX_PORTS )) || {
+        printf '[acct] 当前 %s 个端口超过统计上限 %s，限速仍可用；请缩小范围或调整 ACCT_MAX_PORTS 后启用用量策略。\n' "$total" "$ACCT_MAX_PORTS" >&2
+        return 1
+    }
+}
+
 acct_build_script() {
     local -a ports=()
     local p els_up="" els_down=""
@@ -1148,6 +1194,7 @@ acct_setup_locked() {
         return 1
     }
     load_rules || true
+    acct_capacity_check || return 1
     if (( ${#RULE_IDX[@]} == 0 )); then
         printf '当前没有任何端口规则，请先在 [01] 里配置限速端口。\n' >&2
         return 1
@@ -1387,7 +1434,7 @@ acct_autostart_on() {
 
     {
         printf '[Unit]\n'
-        printf 'Description=portctl traffic accounting sample\n\n'
+        printf 'Description=portctl traffic accounting sample\nAfter=network-online.target limit-ports.service\n\n'
         printf '[Service]\n'
         printf 'Type=oneshot\n'
         printf 'ExecStart=%s acct-sample\n' "$self"
@@ -1401,7 +1448,7 @@ acct_autostart_on() {
         printf '[Unit]\n'
         printf 'Description=portctl traffic accounting timer\n\n'
         printf '[Timer]\n'
-        printf 'OnBootSec=2min\n'
+        printf 'OnBootSec=10s\n'
         printf 'OnUnitActiveSec=1min\n\n'
         printf '[Install]\n'
         printf 'WantedBy=timers.target\n'
@@ -1712,6 +1759,13 @@ FW_PSTART=()
 FW_PEND=()
 FW_SRC=()
 FW_NOTES=""
+FW_FORCE=0
+FW_EXPECTED_VERSION=""
+FW_CONFIG_VERSION="missing"
+
+fw_config_version() {
+    if [[ -f "$FW_CONF_FILE" ]]; then cksum <"$FW_CONF_FILE"; else printf 'missing\n'; fi
+}
 
 fw_action_label() {
     if [[ "$1" == "allow" ]]; then
@@ -1849,6 +1903,8 @@ fw_parse_rule_line() {
     action="${fields[0]}"
     proto="${fields[1]:-all}"
     ports="${fields[2]:-all}"
+    if (( ${#fields[@]} != 3 && ${#fields[@]} != 5 )); then problem="规则需要 3 列或 from 地址两列"; fi
+    if (( ${#fields[@]} == 5 )) && [[ "${fields[3]}" != from ]]; then problem="来源地址必须使用 from"; fi
 
     case "$action" in
         allow) action="allow" ;;
@@ -1894,8 +1950,8 @@ fw_parse_rule_line() {
         if [[ -n "$lineno" && "$lineno" != "0" ]]; then
             loc="$where 第 $lineno 行"
         fi
-        FW_NOTES="${FW_NOTES}  ${loc}已忽略（${problem}）: $line"$'\n'
-        return 0
+        FW_NOTES="${FW_NOTES}  ${loc}错误（${problem}）: $line"$'\n'
+        return 1
     fi
 
     FW_ACT+=("$action")
@@ -1917,19 +1973,20 @@ fw_load() {
     FW_PEND=()
     FW_SRC=()
     FW_NOTES=""
+    FW_CONFIG_VERSION="$(fw_config_version)" || return 1
 
-    local line lineno=0
+    local line lineno=0 invalid=0
     local -a fields=()
 
     if [[ -n "${FW_EXTRA_RULES:-}" ]]; then
         while IFS= read -r line; do
             if [[ -n "${line//[[:space:]]/}" ]]; then
-                fw_parse_rule_line "$line" "临时规则" 0
+                fw_parse_rule_line "$line" "临时规则" 0 || invalid=1
             fi
         done <<<"$FW_EXTRA_RULES"
     fi
 
-    [[ -f "$FW_CONF_FILE" ]] || return 0
+    [[ -f "$FW_CONF_FILE" ]] || { fw_finish_load "$invalid"; return $?; }
 
     while IFS= read -r line; do
         lineno=$((lineno + 1))
@@ -1941,17 +1998,34 @@ fw_load() {
         read -r -a fields <<<"$line"
         case "${fields[0]}" in
             backend)
-                FW_BACKEND_CFG="${fields[1]:-auto}"
+                if (( ${#fields[@]} == 2 )) && [[ "${fields[1]}" =~ ^(auto|iptables|nft|ufw)$ ]]; then
+                    FW_BACKEND_CFG="${fields[1]}"
+                else FW_NOTES+="  第 $lineno 行 backend 配置无效"$'\n'; invalid=1; fi
                 continue
                 ;;
             ssh-protect)
-                FW_SSH_PROTECT="${fields[1]:-yes}"
+                if (( ${#fields[@]} == 2 )) && [[ "${fields[1]}" =~ ^(yes|no)$ ]]; then
+                    FW_SSH_PROTECT="${fields[1]}"
+                else FW_NOTES+="  第 $lineno 行 ssh-protect 配置无效"$'\n'; invalid=1; fi
                 continue
                 ;;
         esac
-        fw_parse_rule_line "$line" "$(basename -- "$FW_CONF_FILE")" "$lineno"
+        fw_parse_rule_line "$line" "$(basename -- "$FW_CONF_FILE")" "$lineno" || invalid=1
     done <"$FW_CONF_FILE"
+    if [[ "$(fw_config_version)" != "$FW_CONFIG_VERSION" ]]; then
+        FW_NOTES+="  配置已被其他会话修改，请刷新后重试"$'\n'
+        invalid=1
+    fi
 
+    fw_finish_load "$invalid"
+}
+
+fw_finish_load() {
+    if (( $1 )); then
+        FW_ACT=() FW_PROTO=() FW_PSTART=() FW_PEND=() FW_SRC=()
+        printf '[firewall] 配置校验失败，整份配置未下发:\n%s' "$FW_NOTES" >&2
+        return 1
+    fi
     return 0
 }
 
@@ -1974,13 +2048,26 @@ fw_save() {
         done
     } >"$tmp"
 
-    if ! run_root install -m 0644 "$tmp" "$FW_CONF_FILE"; then
+    if ! run_root env FW_CONF_FILE="$FW_CONF_FILE" bash "$SELF_PATH" firewall-save \
+        --config-source "$tmp" --expected-version "$FW_CONFIG_VERSION"; then
         rm -f "$tmp"
         printf '%s写入配置失败: %s%s\n' "$RED" "$FW_CONF_FILE" "$RESET"
         return 1
     fi
     rm -f "$tmp"
     return 0
+}
+
+fw_save_config_locked() {
+    local source="$1" expected="$2" tmp
+    [[ "$(fw_config_version)" == "$expected" ]] || {
+        printf '[firewall] 配置已被其他会话修改，请刷新后重试。\n' >&2; return 1;
+    }
+    FW_CONF_FILE="$source" fw_load || return 1
+    tmp="$(mktemp "$(dirname -- "$FW_CONF_FILE")/.portctl-firewall.XXXXXX")" || return 1
+    if ! install -m 0644 "$source" "$tmp" || ! mv -fT "$tmp" "$FW_CONF_FILE"; then
+        rm -f "$tmp"; printf '[firewall] 保存失败，旧配置保留。\n' >&2; return 1
+    fi
 }
 
 fw_detect_backend() {
@@ -2063,42 +2150,29 @@ fw_safety_check() {
         if [[ "${FW_ACT[i]}" != "deny" ]]; then
             continue
         fi
-
-        covers=0
-        for port in $ssh_ports; do
-            if fw_rule_covers_port "$i" "$port"; then
-                covers=1
-            fi
-        done
-        if (( covers == 0 )); then
-            continue
-        fi
+        [[ "${FW_PROTO[i]}" != udp ]] || continue
 
         src="${FW_SRC[i]}"
-        if [[ -n "$src" ]] && ! fw_cidr_covers "$src" "$ip"; then
+        if [[ -n "$ip" && -n "$src" ]] && ! fw_cidr_covers "$src" "$ip"; then
             continue
         fi
-
-        allowed=0
-        for ((j = 0; j < i; j++)); do
-            if [[ "${FW_ACT[j]}" != "allow" ]]; then
-                continue
-            fi
-            if [[ -n "${FW_SRC[j]}" ]] && ! fw_cidr_covers "${FW_SRC[j]}" "$ip"; then
-                continue
-            fi
-            for port in $ssh_ports; do
-                if fw_rule_covers_port "$j" "$port"; then
-                    allowed=1
+        for port in $ssh_ports; do
+            fw_rule_covers_port "$i" "$port" || continue
+            allowed=0
+            for ((j=0;j<i;j++)); do
+                [[ "${FW_ACT[j]}" == allow && "${FW_PROTO[j]}" != udp ]] || continue
+                fw_rule_covers_port "$j" "$port" || continue
+                if [[ -n "${FW_SRC[j]}" ]]; then
+                    [[ -n "$ip" ]] && fw_cidr_covers "${FW_SRC[j]}" "$ip" || continue
                 fi
+                allowed=1; break
             done
+            if (( ! allowed )); then
+                printf '  规则 %s（%s）会封禁 SSH 端口 %s 的新连接\n' \
+                    "$((i + 1))" "$(fw_rule_display "$i")" "$port"
+                risky=1
+            fi
         done
-
-        if (( allowed == 0 )); then
-            printf '  规则 %s（%s）会封禁 SSH 端口 %s 的新连接\n' \
-                "$((i + 1))" "$(fw_rule_display "$i")" "$ssh_ports"
-            risky=1
-        fi
     done
 
     if (( risky == 0 )); then
@@ -2422,6 +2496,14 @@ fw_apply_rules() { fw_with_lock fw_apply_rules_locked; }
 fw_clear_rules() { fw_with_lock fw_clear_rules_locked; }
 
 fw_apply_rules_locked() {
+    fw_load || return 1
+    [[ -z "$FW_EXPECTED_VERSION" || "$FW_EXPECTED_VERSION" == "$FW_CONFIG_VERSION" ]] || {
+        printf '[firewall] 配置已变化，未下发；请刷新后重新确认。\n' >&2; return 1;
+    }
+    if [[ "$FW_SSH_PROTECT" == yes && "$FW_FORCE" != 1 ]] && ! fw_safety_check >&2; then
+        printf '[firewall] 已阻止可能封禁 SSH 的配置。确认意图后可用 firewall-apply --force，或显式设置 ssh-protect no。\n' >&2
+        return 1
+    fi
     case "$(fw_backend)" in
         iptables) fw_iptables_apply ;;
         nft) fw_nft_apply ;;
@@ -2655,7 +2737,8 @@ fw_prompt_src_optional() {
 
 fw_apply_from_menu() {
     local risk_out answer extra="" ip
-    fw_load
+    local -a options=()
+    fw_load || { pause_screen; return; }
 
     if risk_out="$(fw_safety_check)"; then
         extra=""
@@ -2683,10 +2766,12 @@ fw_apply_from_menu() {
             pause_screen
             return
         fi
+        options=(--force)
     fi
 
     printf '\n'
-    if run_root env FW_EXTRA_RULES="$extra" bash "$SELF_PATH" firewall-apply; then
+    if run_root env FW_EXTRA_RULES="$extra" bash "$SELF_PATH" firewall-apply \
+        "${options[@]}" --expected-version "$FW_CONFIG_VERSION"; then
         printf '\n%s规则已下发到系统防火墙。%s\n' "$GREEN" "$RESET"
     else
         printf '\n%s下发失败，请检查上面的错误输出。%s\n' "$RED" "$RESET"
@@ -2733,7 +2818,7 @@ fw_add_port_flow() {
         return
     }
 
-    fw_load
+    fw_load || { pause_screen; return; }
     FW_ACT+=("$action")
     FW_PROTO+=("$proto")
     FW_PSTART+=("$start")
@@ -2771,7 +2856,7 @@ fw_add_ip_flow() {
     }
     read -r start end <<<"$ports_pair"
 
-    fw_load
+    fw_load || { pause_screen; return; }
     FW_ACT+=("$action")
     FW_PROTO+=("all")
     FW_PSTART+=("$start")
@@ -2795,7 +2880,7 @@ fw_delete_flow() {
     draw_brand
     printf '\n%s防火墙规则 > 删除规则%s\n\n' "$YELLOW" "$RESET"
 
-    fw_load
+    fw_load || { pause_screen; return; }
     fw_render_table
     if (( ${#FW_ACT[@]} == 0 )); then
         pause_screen
@@ -2863,7 +2948,7 @@ fw_clear_flow() {
     draw_brand
     printf '\n%s防火墙规则 > 高级与排障 > 清空全部规则%s\n\n' "$YELLOW" "$RESET"
 
-    fw_load
+    fw_load || { pause_screen; return; }
     fw_render_table
     printf '\n%s清空后不会立刻撤销系统里的规则，需要再选「应用当前配置」才会移除链/表。%s\n' \
         "$DIM" "$RESET"
@@ -2994,7 +3079,7 @@ fw_add_menu() {
 show_firewall_advanced_menu() {
     local choice
     while true; do
-        fw_load
+        fw_load || { pause_screen; return; }
         clear_screen
         draw_brand
         printf '\n%s防火墙规则 > 高级与排障%s\n\n' "$YELLOW" "$RESET"
@@ -3017,7 +3102,7 @@ show_firewall_advanced_menu() {
 show_firewall_menu() {
     local choice ip
     while true; do
-        fw_load
+        fw_load || { pause_screen; return; }
         clear_screen
         draw_brand
         printf '\n%s[03] 防火墙规则%s\n' "$YELLOW" "$RESET"
@@ -3320,7 +3405,7 @@ logs_export() {
         tc -s class show 2>&1 || true
 
         printf '\n================ 防火墙 ================\n'
-        fw_load
+        fw_load || true
         case "$(fw_backend)" in
             iptables)
                 iptables -S 2>&1 || true
@@ -3665,12 +3750,26 @@ main_menu() {
 case "${1:-menu}" in
     menu) main_menu ;;
     firewall-apply)
-        fw_load
+        shift
+        while (( $# )); do
+            case "$1" in
+                --force) FW_FORCE=1; shift ;;
+                --expected-version)
+                    [[ $# -ge 2 && -n "$2" ]] || exit 2
+                    FW_EXPECTED_VERSION="$2"; shift 2 ;;
+                *) exit 2 ;;
+            esac
+        done
         fw_apply_rules
         ;;
     firewall-clear)
         fw_load
         fw_clear_rules
+        ;;
+    firewall-save)
+        [[ $# == 5 && "$2" == --config-source && "$4" == --expected-version ]] || exit 2
+        (( EUID == 0 )) || { printf '保存防火墙配置需要 root。\n' >&2; exit 1; }
+        fw_with_lock fw_save_config_locked "$3" "$5"
         ;;
     logs-export)
         logs_export "${2:-40}" "${3:-/root/portctl-diag.txt}"
@@ -3712,7 +3811,7 @@ case "${1:-menu}" in
     acct-remove)
         acct_remove
         ;;
-    policy-tick|policy-status|policy-add|policy-delete|policy-release)
+    policy-tick|policy-status|policy-add|policy-delete|policy-release|policy-last-run)
         declare -F policy_tick >/dev/null || { printf '缺少 policy_engine.sh，请重新安装。\n' >&2; exit 1; }
         case "$1" in
             policy-tick) policy_tick ;;
@@ -3720,10 +3819,11 @@ case "${1:-menu}" in
             policy-add) [[ $# == 8 ]] || exit 2; policy_add "${@:2}" ;;
             policy-delete) [[ $# == 2 ]] || exit 2; policy_delete "$2" ;;
             policy-release) [[ $# == 2 ]] || exit 2; policy_release "$2" ;;
+            policy-last-run) policy_last_run ;;
         esac
         ;;
     --help|-h)
-        printf '用法: %s [menu|firewall-apply|firewall-clear|firewall-status|logs-export <条数> <路径>|traffic|acct-setup|acct-sample|acct-show|acct-reset|acct-remove|policy-tick|policy-status|policy-add|policy-delete|policy-release]\n' "$0"
+        printf '用法: %s [menu|firewall-apply [--force]|firewall-clear|firewall-status|logs-export <条数> <路径>|traffic|acct-setup|acct-sample|acct-show|acct-reset|acct-remove|policy-tick|policy-status|policy-add|policy-delete|policy-release|policy-last-run]\n' "$0"
         printf 'SSH 登录服务器后直接运行即可。默认进入交互式终端菜单。\n'
         ;;
     *)

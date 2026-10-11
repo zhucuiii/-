@@ -134,7 +134,10 @@ policy_save_state() {
 }
 policy_totals() {
     # Read saved + live counters under the same lock as sampling/rebuild/reset.
-    acct_table_exists || { policy_error '统计表未建立，请先建立统计。'; return 1; }
+    if ! acct_table_exists; then
+        [[ "${POLICY_RECOVER:-0}" == 1 ]] && acct_setup_locked ||
+            { policy_error '统计表未建立或恢复失败，请建立统计。'; return 1; }
+    fi
     acct_current
 }
 policy_total_scope() {
@@ -154,6 +157,7 @@ policy_evaluate() {
     period="$(date -d "@$now" +%Y-%m)" || return 1
     minute="$(policy_clock "$(date -d "@$now" +%H:%M)")" || return 1
     POLICY_ROWS="" POLICY_EFFECTIVE=""
+    POLICY_REMAINING=() POLICY_RELEASES=()
     local -A effective=() reasons=()
     for ((j=0; j<${#RULE_IDX[@]}; j++)); do effective["$j"]="${RULE_RATE[j]}"; done
     for ((i=0; i<${#POLICY_IDS[@]}; i++)); do
@@ -211,16 +215,37 @@ policy_evaluate() {
             done
         fi
         POLICY_ROWS+="$id"$'\t'"$type"$'\t'"${POLICY_STARTS[i]}-${POLICY_ENDS[i]}"$'\t'"$used"$'\t'"${POLICY_LIMITS[i]}"$'\t'"$active"$'\t'"$until"$'\t'"$exempt"$'\n'
+        local scope remaining release
+        scope="${POLICY_STARTS[i]}-${POLICY_ENDS[i]}"
+        if [[ "$type" != schedule && "$exempt" == 0 ]]; then
+            remaining=$((POLICY_LIMITS[i] - used)); (( remaining >= 0 )) || remaining=0
+            if [[ -z "${POLICY_REMAINING[$scope]:-}" ]] || (( remaining < POLICY_REMAINING[$scope] )); then
+                POLICY_REMAINING["$scope"]="$remaining"
+            fi
+        fi
+        if (( active )); then
+            case "$type" in
+                monthly) release=下月1日 ;;
+                schedule) release="${POLICY_B[i]}" ;;
+                usage)
+                    if (( until == 1 )); then release=手动解除
+                    else release="$(date -d "@$until" '+%m-%d %H:%M')"; fi ;;
+            esac
+            POLICY_RELEASES["$scope"]="${POLICY_RELEASES[$scope]:-}${POLICY_RELEASES[$scope]:+,}$release"
+        fi
     done
     for ((j=0; j<${#RULE_IDX[@]}; j++)); do
         POLICY_EFFECTIVE+="${RULE_START[j]}"$'\t'"${RULE_END[j]}"$'\t'"${effective[$j]}"$'\n'
     done
 }
+declare -A POLICY_REMAINING=() POLICY_RELEASES=()
+
 policy_collect() {
     POLICY_TOTALS=""
     local type needs=0
     for type in "${POLICY_TYPES[@]}"; do [[ "$type" == schedule ]] || needs=1; done
     if (( needs )); then
+        acct_capacity_check || return 1
         # Fail closed for evaluation, not for connectivity: leave current rates unchanged.
         POLICY_TOTALS="$(acct_with_lock policy_totals)" || return 1
     fi
@@ -229,13 +254,40 @@ policy_apply_effective() {
     local tmp
     tmp="$(mktemp "$POLICY_DIR/rates.XXXXXX")" || return 1
     printf '%s' "$POLICY_EFFECTIVE" >"$tmp"
-    if ! limit_root rate-set --rate-file "$tmp"; then
+    if ! limit_root rate-set --rate-file "$tmp" --expected-version "$RULES_VERSION"; then
         rm -f "$tmp"; policy_error '应用策略失败；状态已保存，下次执行会重试。'; return 1
     fi
     rm -f "$tmp"
 }
+policy_record_run() {
+    local rc="$1" tmp result=success
+    (( rc == 0 )) || result=failed
+    tmp="$(mktemp "$POLICY_DIR/.last-run.XXXXXX")" || return 1
+    if ! printf '%s\t%s\t%s\n' "$(policy_now)" "$result" "$rc" >"$tmp" ||
+       ! mv -f "$tmp" "$POLICY_DIR/last-run.tsv"; then
+        rm -f "$tmp"; return 1
+    fi
+}
+
+policy_last_run() {
+    local ts result code
+    if [[ -d "$POLICY_DIR" && ( ! -r "$POLICY_DIR" || ! -x "$POLICY_DIR" ) ]]; then
+        policy_error '无法读取策略执行记录，请使用 root。'; return 1
+    fi
+    if [[ ! -f "$POLICY_DIR/last-run.tsv" ]]; then printf '最近执行: 尚未执行\n'; return; fi
+    IFS=$'\t' read -r ts result code <"$POLICY_DIR/last-run.tsv" || return 1
+    [[ "$ts" =~ ^[0-9]+$ && "$code" =~ ^[0-9]+$ && "$result" =~ ^(success|failed)$ ]] || {
+        printf '最近执行: 状态文件损坏\n'; return 1;
+    }
+    local label=成功
+    [[ "$result" == success ]] || label="失败（退出码 $code）"
+    printf '最近执行: %s  %s\n' "$(date -d "@$ts" '+%F %T')" "$label"
+}
+
 policy_tick() (
     policy_lock || exit 1
+    POLICY_RECOVER=1
+    trap 'policy_record_run "$?" || true; [[ -z "${POLICY_LOCK_DIR:-}" ]] || rmdir "$POLICY_LOCK_DIR"' EXIT
     policy_load && policy_validate_scopes && policy_load_state && policy_collect || exit 1
     policy_evaluate "$(policy_now)" && policy_save_state || exit 1
     policy_apply_effective
@@ -315,15 +367,42 @@ policy_status() (
     policy_evaluate "$(policy_now)" || exit 1
     printf '# id\ttype\tports\tused_bytes\tlimit_bytes\tactive\tuntil_epoch\texempt\n%s' "$POLICY_ROWS"
     printf '# Effective rates (start, end, rate)\n%s' "$POLICY_EFFECTIVE"
+    local actual="" start end rate scope i
+    local -A rates=()
+    actual="$(limit_local effective-rates 2>/dev/null)" || actual=""
+    while IFS=$'\t' read -r start end rate; do
+        [[ -n "$start" ]] || continue
+        rates["$start-$end"]="$rate"
+    done <<<"$actual"
+    printf '#RULE\tports\tbase_rate\tactual_rate\tremaining_bytes\trelease\n'
+    for ((i=0;i<${#RULE_IDX[@]};i++)); do
+        scope="${RULE_START[i]}-${RULE_END[i]}"
+        printf '#RULE\t%s\t%s\t%s\t%s\t%s\n' "$scope" "${RULE_RATE[i]}" \
+            "${rates[$scope]:-unknown}" "${POLICY_REMAINING[$scope]:--}" "${POLICY_RELEASES[$scope]:--}"
+    done
 )
 policy_enable() {
-    local self tmp
+    local self tmp needs=0 type dependencies="limit-ports.service"
     self="$(fw_installed_self)"
-    # Validate and apply once before enabling unattended execution.
+    command -v systemctl >/dev/null 2>&1 || { policy_error '需要 systemd。'; return 1; }
+    policy_load && policy_validate_scopes || return 1
+    limit_local check || return 1
+    for type in "${POLICY_TYPES[@]}"; do [[ "$type" == schedule ]] || needs=1; done
+    (( ! needs )) || acct_capacity_check || return 1
+    # Enabling unattended enforcement also installs its boot dependencies.
+    if [[ "$(limit_local config-state)" != applied ]]; then
+        limit_root apply --expected-version "$RULES_VERSION" || return 1
+    fi
+    run_root systemctl enable --now limit-ports.service || return 1
+    if (( needs )); then
+        run_root bash "$SELF_PATH" acct-setup || return 1
+        acct_autostart_on || return 1
+        dependencies+=" portctl-accounting.service"
+    fi
     run_root bash "$SELF_PATH" policy-tick || return 1
     tmp="$(mktemp)" || return 1
     {
-        printf '[Unit]\nDescription=Portctl usage and schedule policies\nAfter=network-online.target limit-ports.service\n\n'
+        printf '[Unit]\nDescription=Portctl usage and schedule policies\nWants=network-online.target\nRequires=%s\nAfter=network-online.target %s\n\n' "$dependencies" "$dependencies"
         printf '[Service]\nType=oneshot\nExecStart=%s policy-tick\n' "$self"
     } >"$tmp"
     run_root install -m 0644 "$tmp" "$POLICY_SERVICE_FILE" || { rm -f "$tmp"; return 1; }
@@ -342,7 +421,7 @@ policy_disable() {
     for ((i=0; i<${#RULE_IDX[@]}; i++)); do
         printf '%s\t%s\t%s\n' "${RULE_START[i]}" "${RULE_END[i]}" "${RULE_RATE[i]}"
     done >"$tmp"
-    limit_root rate-set --rate-file "$tmp"
+    limit_root rate-set --rate-file "$tmp" --expected-version "$RULES_VERSION"
     local rc=$?
     rm -f "$tmp"
     return "$rc"
@@ -416,11 +495,21 @@ show_policy_menu() {
         printf '\n%s用量与时段策略%s\n' "$YELLOW" "$RESET"
         timer="$(systemctl is-enabled "$POLICY_TIMER_NAME" 2>/dev/null)" || timer="${timer:-未开启}"
         printf '%s时区:%s %s    %s自动执行:%s %s\n\n' "$DIM" "$RESET" "$(date +%Z)" "$DIM" "$RESET" "$timer"
+        show_config_state
+        run_root bash "$SELF_PATH" policy-last-run || true
         rc=0
         data="$(run_root bash "$SELF_PATH" policy-status 2>&1)" || rc=$?
         if (( rc )); then printf '%s%s%s\n' "$YELLOW" "$data" "$RESET"
         else
             printf '%s\n' "$data" | while IFS=$'\t' read -r id type ports used amount active until exempt; do
+                if [[ "$id" == '#RULE' ]]; then
+                    [[ "$type" != ports ]] || continue
+                    local actual="$used" remaining="$amount"
+                    case "$actual" in unknown) actual=未确认 ;; missing) actual=队列缺失 ;; mixed) actual=混合速率 ;; esac
+                    [[ "$remaining" == - ]] || remaining="$(human_bytes "$remaining")"
+                    printf '端口 %s  基础:%s  生效:%s  剩余:%s  解除:%s\n' "$type" "$ports" "$actual" "$remaining" "$active"
+                    continue
+                fi
                 [[ "$id" != '#'* && -n "$id" ]] || continue
                 [[ "$type" == monthly || "$type" == usage || "$type" == schedule ]] || continue
                 local label status release="-"
