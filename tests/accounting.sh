@@ -13,6 +13,7 @@ export ACCT_TABLE="portctl_acct"
 export ACCT_ERR_FILE="$TMP/acct.err"
 export NFT_CALLS="$TMP/nft.calls"
 export NFT_SCENARIO="missing"
+export NFT_UP_BYTES=30 NFT_DOWN_BYTES=40 NFT_GENERATION=""
 printf 'PORT_SPEC="8080=12mbit"\n' >"$CONFIG_FILE"
 
 # Load the functions without opening the interactive menu.
@@ -29,7 +30,7 @@ nft() {
                     printf 'Operation not permitted\n' >&2
                     return 1
                     ;;
-                read-error|ready|incomplete)
+                read-error|ready|incomplete|wrong-port|malformed)
                     printf 'table inet portctl_acct\n'
                     ;;
                 *)
@@ -39,10 +40,16 @@ nft() {
             ;;
         "list counters table inet portctl_acct"|"reset counters table inet portctl_acct")
             case "$NFT_SCENARIO" in
-                ready)
+                ready|wrong-port|malformed)
+                    local port=8080 up="$NFT_UP_BYTES"
+                    [[ "$NFT_SCENARIO" != wrong-port ]] || port=8443
+                    [[ "$NFT_SCENARIO" != malformed ]] || up=invalid
                     printf 'table inet portctl_acct {\n'
-                    printf '    counter up_8080 {\n        packets 1 bytes 30\n    }\n'
-                    printf '    counter down_8080 {\n        packets 2 bytes 40\n    }\n}\n'
+                    if [[ -n "$NFT_GENERATION" ]]; then
+                        printf '    counter generation_%s {\n        packets 0 bytes 0\n    }\n' "$NFT_GENERATION"
+                    fi
+                    printf '    counter up_%s {\n        packets 1 bytes %s\n    }\n' "$port" "$up"
+                    printf '    counter down_%s {\n        packets 2 bytes %s\n    }\n}\n' "$port" "$NFT_DOWN_BYTES"
                     ;;
                 incomplete)
                     printf 'table inet portctl_acct {\n'
@@ -143,13 +150,14 @@ NFT_SCENARIO=incomplete
 assert_read_failure
 pass "incomplete counter sets are still rejected"
 
-NFT_SCENARIO=missing
-: >"$NFT_CALLS"
-assert_read_failure reset
-[[ "$(cat "$NFT_CALLS")" == "reset counters table inet portctl_acct" ]] ||
-    fail "reset should not use the read-only fallback"
-pass "missing-table reset remains a failure"
+NFT_SCENARIO=wrong-port
+assert_read_failure
+pass "a different port with the same counter count is rejected"
+NFT_SCENARIO=malformed
+assert_read_failure
+pass "non-numeric byte counts cannot corrupt totals"
 
+NFT_SCENARIO=missing
 CONFIG_FILE="$TMP/no-config" bash "$ROOT/portctl.sh" acct-show >"$TMP/out" 2>"$TMP/err"
 assert_output $'#TOTAL\t0\t0'
 assert_quiet
@@ -196,5 +204,41 @@ if bash "$ROOT/portctl.sh" acct-show >"$TMP/out" 2>"$TMP/err"; then
 fi
 [[ ! -s "$TMP/out" && -s "$TMP/err" ]] || fail "invalid rules were presented as empty totals"
 pass "invalid port rules are diagnosed instead of silently producing zero totals"
+
+printf 'PORT_SPEC="8080=12mbit"\n' >"$CONFIG_FILE"
+load_rules
+NFT_SCENARIO=ready
+printf '8080\t100\t200\n' >"$ACCT_FILE"
+: >"$NFT_CALLS"
+acct_sample >"$TMP/out" 2>"$TMP/err"
+[[ "$(acct_current)" == $'8080\t130\t240' ]] || fail "sample double-counted the live counters"
+acct_sample >"$TMP/out" 2>"$TMP/err"
+[[ "$(acct_current)" == $'8080\t130\t240' ]] || fail "repeated sample changed unchanged totals"
+if grep -q '^reset ' "$NFT_CALLS"; then fail "sampling reset kernel counters"; fi
+pass "sampling persists raw baselines without resetting or double-counting counters"
+
+NFT_UP_BYTES=50 NFT_DOWN_BYTES=60
+cp "$ACCT_FILE" "$TMP/before"
+(
+    mv() { return 1; }
+    if acct_sample >"$TMP/out" 2>"$TMP/err"; then fail "failed disk commit succeeded"; fi
+)
+cmp -s "$ACCT_FILE" "$TMP/before" || fail "failed commit changed saved totals"
+[[ "$(acct_current)" == $'8080\t150\t260' ]] || fail "failed commit lost live traffic"
+acct_sample >"$TMP/out" 2>"$TMP/err"
+[[ "$(acct_current)" == $'8080\t150\t260' ]] || fail "retry did not recover the unsaved delta"
+pass "failed disk commits retain live bytes and retries save exactly once"
+
+NFT_GENERATION=second NFT_UP_BYTES=300 NFT_DOWN_BYTES=400
+acct_sample >"$TMP/out" 2>"$TMP/err"
+[[ "$(acct_current)" == $'8080\t450\t660' ]] || fail "new counter generation reused the old baseline"
+pass "replaced tables count new traffic even when counters overtake the old snapshot"
+
+acct_reset >"$TMP/out" 2>"$TMP/err"
+[[ "$(acct_current)" == $'8080\t0\t0' ]] || fail "reset did not zero logical totals"
+NFT_UP_BYTES=330 NFT_DOWN_BYTES=410
+[[ "$(acct_current)" == $'8080\t30\t10' ]] || fail "post-reset traffic used the wrong baseline"
+if grep -q '^reset ' "$NFT_CALLS"; then fail "logical reset cleared kernel counters"; fi
+pass "logical reset preserves counter baselines and counts subsequent traffic"
 
 printf 'Passed %s accounting tests.\n' "$passed"

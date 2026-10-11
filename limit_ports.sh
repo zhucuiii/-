@@ -46,7 +46,7 @@
 #
 set -Eeuo pipefail
 
-LIMIT_PORTS_VERSION="0.6.0"
+LIMIT_PORTS_VERSION="0.6.1"
 
 CONFIG_FILE="${CONFIG_FILE:-/etc/default/limit-ports}"
 if [[ -r "$CONFIG_FILE" ]]; then
@@ -103,6 +103,7 @@ PLAN_ID=()
 PLAN_RATE=()
 PLAN_START=()
 PLAN_END=()
+PLAN_RULE=()
 
 log() {
     printf '[limit-ports] %s\n' "$*"
@@ -486,6 +487,7 @@ build_plan() {
     PLAN_RATE=()
     PLAN_START=()
     PLAN_END=()
+    PLAN_RULE=()
 
     for ((i = 0; i < ${#PARSE_START[@]}; i++)); do
         if [[ "${PARSE_MODE[i]}" == "shared" ]]; then
@@ -493,6 +495,7 @@ build_plan() {
             PLAN_RATE+=("${PARSE_RATE[i]}")
             PLAN_START+=("${PARSE_START[i]}")
             PLAN_END+=("${PARSE_END[i]}")
+            PLAN_RULE+=("$i")
             id=$((id + 1))
         else
             for ((p = PARSE_START[i]; p <= PARSE_END[i]; p++)); do
@@ -500,6 +503,7 @@ build_plan() {
                 PLAN_RATE+=("${PARSE_RATE[i]}")
                 PLAN_START+=("$p")
                 PLAN_END+=("$p")
+                PLAN_RULE+=("$i")
                 id=$((id + 1))
             done
         fi
@@ -700,9 +704,9 @@ precheck_enabled() {
 
 # 0 = ok, 1 = failed, 99 = cannot precheck
 run_precheck() {
-    local batch="$1" dev="lptest0" testbatch rc=0
+    local batch="$1" dev="lp${BASHPID}" testbatch rc=0
     if ip link show dev "$dev" >/dev/null 2>&1; then
-        ip link del "$dev" 2>/dev/null || true
+        return 99
     fi
     if ! ip link add "$dev" type dummy 2>/dev/null; then
         return 99
@@ -783,8 +787,8 @@ rate_set() {
     parse_spec "$SPEC_STRING"
     build_plan
 
-    local -A override=()
-    local start end rate key i batch tmp extra
+    local -A override=() current_rate=() current_ceil=() desired_bps=()
+    local start end rate key i batch extra rule matched current id ceil commands=0
     while IFS=$'\t' read -r start end rate extra; do
         [[ -n "$start" && "$start" != '#'* ]] || continue
         [[ -z "${extra:-}" ]] || die "速率覆盖文件格式无效。"
@@ -794,30 +798,66 @@ rate_set() {
         is_rate "$rate" || die "速率覆盖格式无效: $rate"
         key="$start-$end"
         [[ -z "${override[$key]:-}" ]] || die "速率覆盖重复: $key"
+        matched=0
+        for ((i = 0; i < ${#PARSE_START[@]}; i++)); do
+            if [[ "$start" == "${PARSE_START[i]}" && "$end" == "${PARSE_END[i]}" ]]; then
+                matched=1
+                break
+            fi
+        done
+        (( matched )) || die "速率覆盖未匹配基础规则: $key"
         override["$key"]="$rate"
+        desired_bps["$key"]="$(rate_to_bps "$rate")"
     done <"$RATE_FILE"
 
+    (( ${#override[@]} )) || die "速率覆盖文件没有匹配当前基础规则。"
+    current="$(tc class show dev "$NIC")" || die "无法读取当前限速队列。"
+    while read -r id rate ceil; do
+        [[ -n "$id" ]] || continue
+        current_rate["$id"]="${rate,,}" current_ceil["$id"]="${ceil,,}"
+    done < <(awk '
+        $1=="class" && $2=="htb" {
+            rate=""; ceil=""
+            for(i=4;i<NF;i++) {
+                if($i=="rate") rate=$(i+1)
+                if($i=="ceil") ceil=$(i+1)
+            }
+            if(rate!="" && ceil!="") print $3,rate,ceil
+        }
+    ' <<<"$current")
     batch="$(mktemp "${TMPDIR:-/tmp}/limit-ports-rate.XXXXXX")" || die "无法创建临时文件。"
     : >"$batch"
     for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
-        key="${PLAN_START[i]}-${PLAN_END[i]}"
+        rule="${PLAN_RULE[i]}"
+        key="${PARSE_START[rule]}-${PARSE_END[rule]}"
         if [[ -n "${override[$key]:-}" ]]; then
             rate="${override[$key]}"
+            id="1:${PLAN_ID[i]}"
+            if [[ -z "${current_rate[$id]:-}" ]]; then
+                rm -f "$batch"
+                die "缺少限速队列 $id，请先应用基础规则。"
+            fi
+            if [[ "$(rate_to_bps "${current_rate[$id]}")" == "${desired_bps[$key]}" &&
+                  "$(rate_to_bps "${current_ceil[$id]}")" == "${desired_bps[$key]}" ]]; then
+                continue
+            fi
             printf 'class change dev %s parent 1: classid 1:%s htb rate %s ceil %s burst %s cburst %s\n' \
                 "$NIC" "${PLAN_ID[i]}" "$rate" "$rate" \
                 "$(compute_burst "$rate")" "$(compute_cburst "$rate")" >>"$batch"
+            commands=$((commands + 1))
         fi
     done
     if [[ ! -s "$batch" ]]; then
         rm -f "$batch"
-        die "速率覆盖文件没有匹配当前基础规则。"
+        log "策略速率未变化，无需更新队列。"
+        return 0
     fi
     tc -batch "$batch" || {
         rm -f "$batch"
-        die "速率覆盖应用失败，基础规则保持不变。"
+        die "速率覆盖应用失败，部分队列可能已更新；请重试或重新应用基础规则。"
     }
     rm -f "$batch"
-    log "已更新 ${#override[@]} 条策略速率覆盖。"
+    log "已更新 $commands 个队列（${#override[@]} 条策略速率覆盖）。"
 }
 
 list_rules() {
@@ -934,6 +974,25 @@ status_rules() {
     tc -s class show dev "$NIC"
 }
 
+with_nic_lock() (
+    local lock_dir="${LIMIT_LOCK_DIR:-/run/lock/limit-ports}" lock_file lockdir attempt=0
+    install -d -m 0755 "$lock_dir" || exit 1
+    lock_file="$lock_dir/${NIC//\//_}.lock"
+    if command -v flock >/dev/null 2>&1; then
+        exec {limit_lock_fd}>"$lock_file" || exit 1
+        flock -w 30 "$limit_lock_fd" || die "网卡 $NIC 正在更新，请稍后重试。"
+    else
+        lockdir="${lock_file}.d"
+        while ! mkdir "$lockdir" 2>/dev/null; do
+            attempt=$((attempt + 1))
+            (( attempt < 300 )) || die "网卡 $NIC 正在更新，请稍后重试。"
+            sleep 0.1
+        done
+        trap 'rmdir "$lockdir"' EXIT
+    fi
+    "$@"
+)
+
 main() {
     parse_args "$@"
 
@@ -943,14 +1002,14 @@ main() {
             require_command tc
             require_command ip
             resolve_spec
-            apply_rules
+            with_nic_lock apply_rules
             ;;
         stop)
             require_root
             require_command tc
             require_command ip
             resolve_spec
-            stop_rules
+            with_nic_lock stop_rules
             ;;
         status)
             require_root
@@ -975,9 +1034,10 @@ main() {
             plan_rules
             ;;
         rate-set)
+            require_root
             [[ -n "$RATE_FILE" ]] || die "rate-set 需要 --rate-file。"
             resolve_spec
-            rate_set
+            with_nic_lock rate_set
             ;;
         *)
             die "用法: $0 {apply|stop|status|rules|stats|plan}"

@@ -5,14 +5,14 @@
 #
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SELF_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+ROOT_DIR="$(dirname -- "$SELF_PATH")"
 CONFIG_FILE="${CONFIG_FILE:-/etc/default/limit-ports}"
 LIMIT_SCRIPT="${LIMIT_SCRIPT:-/usr/local/sbin/limit_ports.sh}"
 INSTALL_URL="${INSTALL_URL:-https://raw.githubusercontent.com/zhucuiii/-/main/install.sh}"
 if [[ ! -f "$LIMIT_SCRIPT" ]]; then
     LIMIT_SCRIPT="$ROOT_DIR/limit_ports.sh"
 fi
-SELF_PATH="$ROOT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
 if [[ -f "$ROOT_DIR/policy_engine.sh" ]]; then
     source "$ROOT_DIR/policy_engine.sh"
 fi
@@ -1044,9 +1044,8 @@ show_all_port_traffic() {
 #   ingress, user upload   : prerouting,  dport == the user's port
 #   egress,  user download : postrouting, sport == the user's port
 #
-# `nft reset counters` both dumps and clears in one go, so folding the live
-# counters into a file on disk never drops a packet, and the totals survive a
-# reboot even though the nft rules themselves do not.
+# Persist totals and their raw-counter baselines together. Sampling never
+# resets kernel counters, so a failed disk write can be retried without loss.
 
 ACCT_TABLE="${ACCT_TABLE:-portctl_acct}"
 ACCT_DIR="${ACCT_DIR:-/var/lib/portctl}"
@@ -1117,7 +1116,13 @@ acct_build_script() {
         els_down+="${els_down:+, }$p : \"down_$p\""
     done
 
+    local generation
+    generation="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)" ||
+        generation="$(date +%s%N)_$$"
+    generation="${generation//-/}"
+    generation="${generation//_/}"
     printf 'table inet %s {\n' "$ACCT_TABLE"
+    printf '    counter generation_%s {\n    }\n' "$generation"
     for p in "${ports[@]}"; do
         printf '    counter up_%s {\n    }\n' "$p"
         printf '    counter down_%s {\n    }\n' "$p"
@@ -1201,25 +1206,17 @@ acct_remove_locked() {
     return 0
 }
 
-# 输出: port<TAB>up<TAB>down
-# $1 = reset（读取并清零，用于折叠）| 省略（只读）
-#
-# reset 会把内核计数器清零，所以只有在确认拿到了**完整**列表时才允许折叠：
-# 任何一次 nft 调用失败或输出异常，都必须放弃本次折叠而不是把残缺数据当真。
+# Output: #GENERATION marker followed by port<TAB>up<TAB>down rows.
+# A generation counter identifies table replacement even if the new byte
+# counts have already overtaken the previous snapshot.
 acct_read_counters() {
-    local mode="${1:-read}" out rc=0 expected seen tables
-
-    if [[ "$mode" == "reset" ]]; then
-        out="$(nft reset counters table inet "$ACCT_TABLE" 2>&1)" || rc=$?
-    else
-        out="$(nft list counters table inet "$ACCT_TABLE" 2>&1)" || rc=$?
-    fi
+    local out rc=0 expected tables boot
+    out="$(nft list counters table inet "$ACCT_TABLE" 2>&1)" || rc=$?
 
     if (( rc != 0 )); then
         # An absent table is normal before setup, after removal or after reboot.
         # Only a successful table listing can distinguish it from access errors.
-        if [[ "$mode" == "read" ]] &&
-            tables="$(nft list tables inet 2>/dev/null)" &&
+        if tables="$(nft list tables inet 2>/dev/null)" &&
             ! grep -Fxq -- "table inet $ACCT_TABLE" <<<"$tables"; then
             return 0
         fi
@@ -1231,37 +1228,46 @@ acct_read_counters() {
         return 1
     fi
 
-    # 该有的计数器一个都不能少，少一个就意味着有字节会被漏掉。
-    expected="$(acct_ports 2>/dev/null | wc -l)" || expected=0
-    seen="$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*counter (up|down)_[0-9]+' || true)"
-    if [[ "${ACCT_SKIP_EXPECTED:-0}" != 1 ]] && (( expected > 0 )) && (( seen != expected * 2 )); then
-        printf '[acct] 只读到 %s/%s 个计数器，放弃本次读取。\n' \
-            "$seen" "$((expected * 2))" >&2
-        if (( seen > 0 )); then
-            printf '[acct] 端口规则和已建立的统计表不一致（改过端口规则？），\n' >&2
-            printf '[acct] 请在「流量查看 > 上行 / 下行累计」里选「2. 建立 / 重建统计」。\n' >&2
-        fi
-        return 1
+    expected=""
+    if [[ "${ACCT_SKIP_EXPECTED:-0}" != 1 && ${#RULE_IDX[@]} -gt 0 ]]; then
+        expected="$(acct_ports)" || return 1
     fi
-
-    printf '%s\n' "$out" | awk '
-        /counter (up|down)_[0-9]+/ {
+    boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" || boot=unknown
+    if ! printf '%s\n' "$out" | LC_ALL=C awk -v expected="$expected" -v legacy="legacy_$boot" '
+        BEGIN {
+            n=split(expected, ports, "\n")
+            for(i=1;i<=n;i++) if(ports[i]!="") want[ports[i]]=1
+        }
+        /^[[:space:]]*counter / {
+            if(name!="") bad=1
             name = $2
+            if(name !~ /^(up|down)_[0-9]+$/ && name !~ /^generation_[a-zA-Z0-9]+$/) bad=1
+            if(names[name]++) bad=1
             next
         }
-        /packets/ {
-            if (name == "") { next }
+        /^[[:space:]]*packets / {
+            if(name=="" || $2 !~ /^[0-9]+$/ || $3!="bytes" || $4 !~ /^[0-9]+$/) { bad=1; next }
+            if(name ~ /^generation_/) { generation=name; generations++; name=""; next }
             split(name, part, "_")
             p = part[2]
-            if (part[1] == "up") { up[p] += $4 }
-            else { down[p] += $4 }
+            if(p<1 || p>65535 || $4+0>9e15) bad=1
+            if (part[1] == "up") { up[p]=$4; hasup[p]=1 }
+            else { down[p]=$4; hasdown[p]=1 }
             name = ""
         }
         END {
-            for (p in up) { printf "%s\t%.0f\t%.0f\n", p, up[p], down[p] + 0 }
-            for (p in down) { if (!(p in up)) { printf "%s\t0\t%.0f\n", p, down[p] } }
+            if(name!="" || generations>1) bad=1
+            for(p in hasup) if(!(p in hasdown) || (expected!="" && !(p in want))) bad=1
+            for(p in hasdown) if(!(p in hasup)) bad=1
+            for(p in want) if(!(p in hasup) || !(p in hasdown)) bad=1
+            if(bad) exit 1
+            printf "#GENERATION\t%s\n", generation!="" ? generation : legacy
+            for(p in hasup) printf "%s\t%.0f\t%.0f\n",p,up[p],down[p]
         }
-    '
+    '; then
+        printf '[acct] 计数器缺失、端口不匹配或输出损坏，请建立 / 重建统计。\n' >&2
+        return 1
+    fi
 }
 
 acct_load_totals() {
@@ -1270,20 +1276,65 @@ acct_load_totals() {
 }
 
 # 已有累计 + 尚未折叠的实时计数
+acct_snapshot_rows() {
+    local live="$1" reset="${2:-0}" ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    {
+        if [[ -f "$ACCT_FILE" ]]; then
+            awk '{ print "saved\t" $0 }' "$ACCT_FILE" || return 1
+        fi
+        awk '{ print "live\t" $0 }' <<<"$live"
+    } | LC_ALL=C awk -F'\t' -v ts="$ts" -v reset="$reset" '
+        $1=="saved" && ($2=="" || $2 ~ /^#/) { next }
+        $1=="saved" && $2 !~ /^#/ && NF>=4 {
+            p=$2
+            if(p !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ || seen[p]++) bad=1
+            up[p]=$3; down[p]=$4; gen[p]=$6; ru[p]=$7+0; rd[p]=$8+0
+            if(NF>=6 && ($7 !~ /^[0-9]+$/ || $8 !~ /^[0-9]+$/)) bad=1
+            next
+        }
+        $1=="saved" && $2 !~ /^#/ { bad=1; next }
+        $1=="live" && $2=="#GENERATION" { generation=$3; next }
+        $1=="live" && $2 ~ /^[0-9]+$/ {
+            p=$2
+            du=$3+0; dd=$4+0
+            if(gen[p]==generation) {
+                if(du>=ru[p]) du-=ru[p]
+                if(dd>=rd[p]) dd-=rd[p]
+            }
+            up[p]+=du; down[p]+=dd; gen[p]=generation; ru[p]=$3; rd[p]=$4
+        }
+        END {
+            for(p in up) if(up[p]<0 || down[p]<0 || up[p]>9e15 || down[p]>9e15) bad=1
+            if(bad) exit 1
+            for(p in up) printf "%s\t%.0f\t%.0f\t%s\t%s\t%.0f\t%.0f\n",p,
+                reset ? 0 : up[p], reset ? 0 : down[p],ts,gen[p],ru[p],rd[p]
+        }
+    ' | sort -n
+}
+
 acct_current() {
-    local totals live rc=0
-    totals="$(acct_load_totals)" || rc=$?
-    live="$(acct_read_counters read)" || rc=$?
-    printf '%s\n%s\n' "$totals" "$live" |
-        awk -F'\t' '
-            $1 ~ /^#/ { next }
-            NF >= 3 { up[$1] += $2; down[$1] += $3 }
-            END { for (p in up) { printf "%s\t%.0f\t%.0f\n", p, up[p], down[p] } }
-        ' | sort -n || return $?
+    local live rows rc=0
+    live="$(acct_read_counters)" || rc=$?
+    rows="$(acct_snapshot_rows "$live")" || return 1
+    awk -F'\t' '{printf "%s\t%s\t%s\n",$1,$2,$3}' <<<"$rows" | sed '/^[[:space:]]*$/d'
     return "$rc"
 }
 
-# 把实时计数原子地读走并清零，累加进磁盘
+acct_save_snapshot() {
+    local live="$1" reset="${2:-0}" tmp
+    install -d -m 0755 "$ACCT_DIR" || return 1
+    tmp="$(mktemp "$ACCT_DIR/traffic.XXXXXX")" || return 1
+    if ! {
+        printf '# port\tup_bytes\tdown_bytes\tupdated\tgeneration\traw_up\traw_down\n' &&
+        acct_snapshot_rows "$live" "$reset"
+    } >"$tmp" || ! mv -f "$tmp" "$ACCT_FILE"; then
+        rm -f "$tmp"
+        printf '[acct] 保存失败，内核计数未清零，下次采样可重试。\n' >&2
+        return 1
+    fi
+}
+
 acct_sample_locked() {
     acct_available || return 1
 
@@ -1294,9 +1345,7 @@ acct_sample_locked() {
     fi
 
     local live
-    if ! live="$(acct_read_counters reset)"; then
-        # 读取不完整时绝不能折叠：reset 可能已经清零，但我们手里的数据是残的。
-        # 直接失败退出，让 systemd 记录一次失败的采样，而不是悄悄丢掉流量。
+    if ! live="$(acct_read_counters)"; then
         printf '[acct] 本次采样放弃，未写入累计文件。\n' >&2
         return 1
     fi
@@ -1304,39 +1353,16 @@ acct_sample_locked() {
         return 0
     fi
 
-    install -d -m 0755 "$ACCT_DIR" || return 1
-    local tmp ts
-    ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    tmp="$(mktemp "$ACCT_DIR/traffic.XXXXXX")" || return 1
-
-    {
-        printf '# port\tup_bytes\tdown_bytes\tupdated\n'
-        {
-            acct_load_totals
-            printf '%s\n' "$live"
-        } | awk -F'\t' -v ts="$ts" '
-            $1 ~ /^#/ { next }
-            NF >= 3 { up[$1] += $2; down[$1] += $3 }
-            END {
-                    for (p in up) { printf "%s\t%.0f\t%.0f\t%s\n", p, up[p], down[p], ts }
-            }
-        ' | sort -n
-    } >"$tmp"
-
-    if ! mv -f "$tmp" "$ACCT_FILE"; then
-        rm -f "$tmp"
-        return 1
-    fi
-    return 0
+    acct_save_snapshot "$live"
 }
 
 acct_reset_locked() {
     acct_available || return 1
+    local live=""
     if acct_table_exists; then
-        nft reset counters table inet "$ACCT_TABLE" >/dev/null || return 1
+        live="$(acct_read_counters)" || return 1
     fi
-    install -d -m 0755 "$ACCT_DIR" || return 1
-    [[ -f "$ACCT_FILE" ]] && rm -f "$ACCT_FILE"
+    acct_save_snapshot "$live" 1 || return 1
     printf '累计流量已清零。\n'
     return 0
 }
@@ -1404,7 +1430,7 @@ acct_autostart_off() {
 # 输出: 合计<TAB>端口<TAB>上行<TAB>下行<TAB>限速，最后一行是 #TOTAL<TAB>上行<TAB>下行
 acct_rows_for_menu() {
     local data rc=0
-    data="$(acct_current)" || rc=$?
+    data="$(acct_with_lock acct_current)" || rc=$?
     local -A up=() down=()
     local p u d
 
@@ -1676,6 +1702,7 @@ FW_UNIT_FILE="${FW_UNIT_FILE:-/etc/systemd/system/portctl-firewall.service}"
 FW_UNIT_NAME="portctl-firewall.service"
 FW_IPT_CHAIN="PORTCTL"
 FW_NFT_TABLE="portctl"
+FW_LOCK_FILE="${FW_LOCK_FILE:-/run/lock/portctl-firewall.lock}"
 
 FW_BACKEND_CFG="auto"
 FW_SSH_PROTECT="yes"
@@ -2129,7 +2156,7 @@ fw_rule_protos() {
 }
 
 fw_iptables_emit() {
-    local cmd="$1" i="$2" proto="$3"
+    local i="$1" proto="$2"
     local -a args=(-A "$FW_IPT_CHAIN")
 
     if [[ -n "${FW_SRC[i]}" ]]; then
@@ -2152,7 +2179,8 @@ fw_iptables_emit() {
         args+=(-j DROP)
     fi
 
-    "$cmd" "${args[@]}"
+    printf '%s ' "${args[@]}"
+    printf '\n'
 }
 
 fw_iptables_teardown() {
@@ -2167,51 +2195,68 @@ fw_iptables_teardown() {
 }
 
 fw_iptables_apply() {
-    local -a cmds=()
-    if fw_need_family 4; then
-        cmds+=(iptables)
-    fi
-    if command -v ip6tables >/dev/null 2>&1 && fw_need_family 6; then
-        cmds+=(ip6tables)
-    fi
-
-    fw_iptables_teardown
-
-    if (( ${#cmds[@]} == 0 )); then
-        printf '[firewall] 没有规则需要下发，链 %s 已移除。\n' "$FW_IPT_CHAIN"
-        return 0
-    fi
-
-    local cmd i proto target family
-    for cmd in "${cmds[@]}"; do
-        if ! "$cmd" -N "$FW_IPT_CHAIN" 2>/dev/null; then
-            "$cmd" -F "$FW_IPT_CHAIN" 2>/dev/null || true
+    local cmd family i proto src old_rules had_chain had_hook dir rc=0 applied
+    local -a cmds=() committed=()
+    dir="$(mktemp -d)" || return 1
+    for family in 4 6; do
+        cmd=iptables
+        [[ "$family" != 6 ]] || cmd=ip6tables
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            if fw_need_family "$family"; then
+                printf '[firewall] 缺少 %s，未修改现有规则。\n' "$cmd" >&2
+                rm -rf "$dir"; return 1
+            fi
+            continue
         fi
-        if ! "$cmd" -I INPUT 1 -j "$FW_IPT_CHAIN"; then
-            printf '[firewall] 无法把链 %s 挂到 %s 的 INPUT 上。\n' \
-                "$FW_IPT_CHAIN" "$cmd" >&2
-            return 1
+        if ! command -v "$cmd-restore" >/dev/null 2>&1; then
+            printf '[firewall] 缺少 %s-restore，未修改现有规则。\n' "$cmd" >&2
+            rm -rf "$dir"; return 1
         fi
-    done
-
-    for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
-        family="$(fw_src_family "${FW_SRC[i]}")"
-        for proto in $(fw_rule_protos "$i"); do
-            for target in "${cmds[@]}"; do
-                if [[ "$family" == "4" && "$target" == "ip6tables" ]]; then
-                    continue
-                fi
-                if [[ "$family" == "6" && "$target" == "iptables" ]]; then
-                    continue
-                fi
-                fw_iptables_emit "$target" "$i" "$proto" || return 1
+        # Read failures must not be mistaken for an absent chain.
+        if ! old_rules="$("$cmd" -w 30 -S)"; then
+            rm -rf "$dir"; return 1
+        fi
+        had_chain=0 had_hook=0
+        grep -Fxq -- "-N $FW_IPT_CHAIN" <<<"$old_rules" && had_chain=1
+        grep -Fxq -- "-A INPUT -j $FW_IPT_CHAIN" <<<"$old_rules" && had_hook=1
+        if ! fw_need_family "$family" && (( ! had_chain )); then continue; fi
+        cmds+=("$cmd")
+        {
+            printf '*filter\n:%s - [0:0]\n-F %s\n' "$FW_IPT_CHAIN" "$FW_IPT_CHAIN"
+            for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
+                src="$(fw_src_family "${FW_SRC[i]}")"
+                [[ "$src" == both || "$src" == "$family" ]] || continue
+                for proto in $(fw_rule_protos "$i"); do fw_iptables_emit "$i" "$proto"; done
             done
-        done
+            (( had_hook )) || printf -- '-I INPUT 1 -j %s\n' "$FW_IPT_CHAIN"
+            printf 'COMMIT\n'
+        } >"$dir/$cmd.new"
+        {
+            printf '*filter\n:%s - [0:0]\n-F %s\n' "$FW_IPT_CHAIN" "$FW_IPT_CHAIN"
+            awk -v chain="$FW_IPT_CHAIN" '$1 == "-A" && $2 == chain' <<<"$old_rules"
+            (( had_hook )) || printf -- '-D INPUT -j %s\n' "$FW_IPT_CHAIN"
+            (( had_chain )) || printf -- '-X %s\n' "$FW_IPT_CHAIN"
+            printf 'COMMIT\n'
+        } >"$dir/$cmd.old"
+        if ! "$cmd-restore" --wait 30 --noflush --test <"$dir/$cmd.new"; then
+            printf '[firewall] %s 校验失败，未修改现有规则。\n' "$cmd" >&2
+            rm -rf "$dir"; return 1
+        fi
     done
-
-    printf '[firewall] 已下发 %s 条规则到链 %s（%s）。\n' \
-        "${#FW_ACT[@]}" "$FW_IPT_CHAIN" "${cmds[*]}"
-    return 0
+    for cmd in "${cmds[@]}"; do
+        if ! "$cmd-restore" --wait 30 --noflush <"$dir/$cmd.new"; then
+            rc=1
+            for applied in "${committed[@]}"; do
+                "$applied-restore" --wait 30 --noflush <"$dir/$applied.old" ||
+                    printf '[firewall] %s 恢复失败，请检查系统规则。\n' "$applied" >&2
+            done
+            break
+        fi
+        committed+=("$cmd")
+    done
+    rm -rf "$dir"
+    (( rc == 0 )) || { printf '[firewall] 下发失败，已尝试恢复旧规则。\n' >&2; return 1; }
+    printf '[firewall] 已批量下发 %s 条规则到链 %s。\n' "${#FW_ACT[@]}" "$FW_IPT_CHAIN"
 }
 
 fw_nft_ports() {
@@ -2224,7 +2269,7 @@ fw_nft_ports() {
 }
 
 fw_nft_apply() {
-    local i proto line body=""
+    local i proto line body="" script
 
     for ((i = 0; i < ${#FW_ACT[@]}; i++)); do
         for proto in $(fw_rule_protos "$i"); do
@@ -2252,18 +2297,26 @@ fw_nft_apply() {
         done
     done
 
-    if nft list table inet "$FW_NFT_TABLE" >/dev/null 2>&1; then
-        nft delete table inet "$FW_NFT_TABLE" || return 1
-    fi
-
+    script="$(mktemp)" || return 1
+    local tables
+    if ! tables="$(nft list tables inet)"; then rm -f "$script"; return 1; fi
     {
+        if grep -Fxq -- "table inet $FW_NFT_TABLE" <<<"$tables"; then
+            printf 'delete table inet %s\n' "$FW_NFT_TABLE"
+        fi
         printf 'table inet %s {\n' "$FW_NFT_TABLE"
         printf '    chain input {\n'
         printf '        type filter hook input priority -150; policy accept;\n'
         printf '%s' "$body"
         printf '    }\n'
         printf '}\n'
-    } | nft -f - || return 1
+    } >"$script"
+    if ! nft -c -f "$script" || ! nft -f "$script"; then
+        rm -f "$script"
+        printf '[firewall] 下发失败，旧表保持原样。\n' >&2
+        return 1
+    fi
+    rm -f "$script"
 
     printf '[firewall] 已下发 %s 条规则到表 inet %s。\n' "${#FW_ACT[@]}" "$FW_NFT_TABLE"
     return 0
@@ -2348,7 +2401,27 @@ fw_ufw_apply() {
     return 0
 }
 
-fw_apply_rules() {
+fw_with_lock() (
+    local lockdir="${FW_LOCK_FILE}.d" attempt=0
+    install -d -m 0755 "$(dirname -- "$FW_LOCK_FILE")" || exit 1
+    if command -v flock >/dev/null 2>&1; then
+        exec {fw_lock_fd}>"$FW_LOCK_FILE" || exit 1
+        flock -w 30 "$fw_lock_fd" || exit 1
+    else
+        while ! mkdir "$lockdir" 2>/dev/null; do
+            attempt=$((attempt + 1))
+            (( attempt < 300 )) || exit 1
+            sleep 0.1
+        done
+        trap 'rmdir "$lockdir"' EXIT
+    fi
+    "$@"
+)
+
+fw_apply_rules() { fw_with_lock fw_apply_rules_locked; }
+fw_clear_rules() { fw_with_lock fw_clear_rules_locked; }
+
+fw_apply_rules_locked() {
     case "$(fw_backend)" in
         iptables) fw_iptables_apply ;;
         nft) fw_nft_apply ;;
@@ -2360,7 +2433,7 @@ fw_apply_rules() {
     esac
 }
 
-fw_clear_rules() {
+fw_clear_rules_locked() {
     case "$(fw_backend)" in
         iptables)
             fw_iptables_teardown
@@ -2445,8 +2518,6 @@ fw_autostart_on() {
 
 fw_autostart_off() {
     if command -v systemctl >/dev/null 2>&1; then
-        run_root systemctl disable --now portctl-policy.timer 2>/dev/null || true
-        run_root rm -f /etc/systemd/system/portctl-policy.timer /etc/systemd/system/portctl-policy.service
         run_root systemctl disable --now "$FW_UNIT_NAME" 2>/dev/null || true
     fi
     run_root rm -f "$FW_UNIT_FILE"
@@ -3508,6 +3579,10 @@ uninstall_program() {
     printf '\n是否同时删除配置 /etc/default/limit-ports？[y/N]: '
     read -r remove_config || return 0
     if command -v systemctl >/dev/null 2>&1; then
+        run_root systemctl disable --now "${POLICY_TIMER_NAME:-portctl-policy.timer}" 2>/dev/null || true
+        run_root systemctl stop portctl-policy.service 2>/dev/null || true
+        run_root rm -f "${POLICY_TIMER_FILE:-/etc/systemd/system/portctl-policy.timer}" \
+            "${POLICY_SERVICE_FILE:-/etc/systemd/system/portctl-policy.service}"
         run_root systemctl disable --now limit-ports.service 2>/dev/null || true
         run_root rm -f /etc/systemd/system/limit-ports.service
         run_root systemctl disable --now "$FW_UNIT_NAME" 2>/dev/null || true
@@ -3522,6 +3597,7 @@ uninstall_program() {
     fi
     run_root rm -f /usr/local/bin/zc
     run_root rm -f /usr/local/sbin/portctl.sh
+    run_root rm -f /usr/local/sbin/policy_engine.sh
     run_root rm -f /usr/local/sbin/limit_ports.sh
     if [[ "${remove_config,,}" == "y" || "${remove_config,,}" == "yes" ]]; then
         run_root rm -f /etc/default/limit-ports
