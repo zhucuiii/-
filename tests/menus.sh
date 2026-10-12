@@ -126,6 +126,51 @@ for menu in main_menu show_limit_menu show_rule_edit_menu \
 done
 pass "all reorganized menus handle end-of-input without looping"
 
+(
+    export CONFIG_FILE="$TMP/status-config"
+    show_config_state() { :; }
+    print_rules_table() { :; }
+    check_rate_header() {
+        local expected="$1" view
+        for view in draw_status show_limit_menu; do
+            "$view" <<<0 >"$TMP/status.out" 2>"$TMP/status.err"
+            grep -Fq "当前速率: $expected" "$TMP/status.out" ||
+                fail "$view did not display rule rate [$expected]"
+            if grep -Fq '默认速率' "$TMP/status.out"; then
+                fail "$view still displays the default rate label"
+            fi
+            [[ ! -s "$TMP/status.err" ]] || fail "$view produced stderr"
+        done
+    }
+
+    printf 'SPEED="12mbit"\nPORT_SPEC="8080=40mbit"\n' >"$CONFIG_FILE"
+    check_rate_header '40mbit (5.00 MB/s)'
+    printf 'SPEED="12mbit"\nPORT_SPEC="8080=80mbit 9000-9002=80mbit@shared"\n' >"$CONFIG_FILE"
+    check_rate_header '80mbit (10.00 MB/s)'
+    printf 'PORT_SPEC="8080=1gbit"\n' >"$CONFIG_FILE"
+    check_rate_header '1gbit (125.00 MB/s)'
+    printf 'PORT_SPEC="8080=800kbit"\n' >"$CONFIG_FILE"
+    check_rate_header '800kbit (0.1000 MB/s)'
+)
+pass "both headers read current single and uniform rule rates instead of SPEED, including refresh and unit conversion"
+(
+    export CONFIG_FILE="$TMP/status-config"
+    show_config_state() { :; }
+    printf 'PORT_SPEC="8080=20mbit 9000=40mbit"\n' >"$CONFIG_FILE"
+    draw_status >"$TMP/status.out"
+    grep -Fq '当前速率: 多种速率（见规则列表）' "$TMP/status.out" || fail "mixed rule rates are misleading"
+    printf 'PORT_SPEC=""\n' >"$CONFIG_FILE"
+    draw_status >"$TMP/status.out"
+    grep -Fq '当前速率: 未设置' "$TMP/status.out" || fail "empty rules display a default rate"
+    CONFIG_FILE="$TMP/no-status-config" draw_status >"$TMP/status.out"
+    grep -Fq '当前速率: 未设置' "$TMP/status.out" || fail "missing config displays a default rate"
+    printf 'PORT_SPEC="8080=invalid"\n' >"$CONFIG_FILE"
+    draw_status >"$TMP/status.out" 2>"$TMP/status.err"
+    grep -Fq '当前速率: 读取失败' "$TMP/status.out" || fail "invalid rules display a stale or default rate"
+    [[ ! -s "$TMP/status.err" ]] || fail "invalid rule header produced stderr"
+)
+pass "rate summaries handle mixed, empty, missing and invalid rules without falling back to SPEED"
+
 [[ "$(prompt_port_range <<<8080 2>/dev/null)" == $'8080\t8080' ]] || fail "single port input"
 [[ "$(prompt_port_range <<<10001-10200 2>/dev/null)" == $'10001\t10200' ]] || fail "range input"
 [[ "$(prompt_port_range <<<00080-00081 2>/dev/null)" == $'80\t81' ]] || fail "decimal port normalization"

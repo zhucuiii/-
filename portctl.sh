@@ -169,11 +169,16 @@ draw_brand() {
 }
 
 draw_status() {
-    local host
+    local host rate_label
     host="$(hostname 2>/dev/null || printf 'unknown')"
+    if load_rules; then
+        rate_label="$(rule_rate_summary)"
+    else
+        rate_label="读取失败"
+    fi
     printf '\n%s主机:%s %s\n' "$DIM" "$RESET" "$host"
-    printf '%s网卡:%s %s    %s默认速率:%s %s (%s)\n' \
-        "$DIM" "$RESET" "$NIC" "$DIM" "$RESET" "$SPEED" "$(current_rate_mb "$SPEED")"
+    printf '%s网卡:%s %s    %s当前速率:%s %s\n' \
+        "$DIM" "$RESET" "$NIC" "$DIM" "$RESET" "$rate_label"
     show_config_state
 }
 
@@ -242,6 +247,22 @@ load_rules() {
     done <<<"$out"
 
     return 0
+}
+
+rule_rate_summary() {
+    if (( ${#RULE_RATE[@]} == 0 )); then
+        printf '未设置'
+        return 0
+    fi
+
+    local rate="${RULE_RATE[0]}" other
+    for other in "${RULE_RATE[@]}"; do
+        if [[ "$other" != "$rate" ]]; then
+            printf '多种速率（见规则列表）'
+            return 0
+        fi
+    done
+    printf '%s (%s)' "$rate" "$(current_rate_mb "$rate")"
 }
 
 print_rules_table() {
@@ -1707,18 +1728,24 @@ show_limit_advanced_menu() {
 }
 
 show_limit_menu() {
-    local choice
+    local choice rate_label rules_ok
 
     while true; do
         clear_screen
         draw_brand
+        if load_rules; then
+            rules_ok=yes
+            rate_label="$(rule_rate_summary)"
+        else
+            rules_ok=no
+            rate_label="读取失败"
+        fi
         printf '\n%s[01] 端口限速%s\n' "$YELLOW" "$RESET"
-        printf '%s网卡:%s %s    %s默认速率:%s %s (%s)\n' \
-            "$DIM" "$RESET" "$NIC" "$DIM" "$RESET" "$SPEED" \
-            "$(current_rate_mb "$SPEED")"
+        printf '%s网卡:%s %s    %s当前速率:%s %s\n' \
+            "$DIM" "$RESET" "$NIC" "$DIM" "$RESET" "$rate_label"
 
         printf '\n%s当前限速规则%s\n' "$CYAN" "$RESET"
-        if load_rules; then
+        if [[ "$rules_ok" == yes ]]; then
             print_rules_table
         else
             printf '%s  读取规则失败: %s%s\n' "$RED" "$RULES_ERROR" "$RESET"
