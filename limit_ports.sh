@@ -27,8 +27,8 @@
 #     only covers IPv4 and needs one filter per port.
 #   * Every shaped class gets an fq_codel child qdisc; otherwise the leaf
 #     queue is a plain FIFO and latency collapses under load.
-#   * Commands are applied through a single `tc -batch` call. On failure the
-#     root qdisc is removed again: fail open, never half-configured.
+#   * Failed batches restore the last managed rules and live policy rates.
+#     Without a recoverable snapshot, remove partial rules and fail open.
 #
 # Rules are separated by spaces, commas, semicolons or newlines, and must
 # not overlap.
@@ -87,6 +87,9 @@ PRECHECK="${PRECHECK:-auto}"
 FILTER_KIND="${FILTER_KIND:-auto}"
 # auto | yes | no   (auto = shape IPv6 when the NIC has a global address)
 IPV6_MODE="${IPV6_MODE:-auto}"
+# yes = refuse to apply when IPv6 is requested but the selected classifier
+# cannot actually match IPv6 traffic; no = allow the explicit IPv4-only risk.
+IPV6_STRICT="${IPV6_STRICT:-yes}"
 FQ_CODEL="${FQ_CODEL:-yes}"
 FQ_CODEL_OPTS="${FQ_CODEL_OPTS:- flows 256 limit 1024}"
 # empty = derive from the class rate
@@ -130,7 +133,7 @@ die() {
 usage() {
     cat <<'USAGE'
 用法:
-  limit_ports.sh [apply|stop|status|rules|stats|plan|rate-set|config-state|effective-rates|capacity|check] [选项]
+  limit_ports.sh [apply|stop|status|rules|stats|plan|rate-set|config-state|effective-rates|capacity|coverage|check] [选项]
 
 动作:
   apply        应用限速规则（默认动作）
@@ -142,6 +145,7 @@ usage() {
   config-state 显示当前配置是否已应用（只读）
   effective-rates 读取实际生效的队列速率（只读）
   capacity     显示端口数量、队列数量和统计容量（只读）
+  coverage     显示 IPv4/IPv6 限速覆盖与风险（只读）
   check        校验配置与容量（只读）
   rate-set     更新已应用配置对应的队列速率
 
@@ -184,7 +188,7 @@ require_option_value() {
 parse_args() {
     while (($# > 0)); do
         case "$1" in
-            apply|stop|status|rules|stats|plan|rate-set|config-save|config-state|check|effective-rates|capacity)
+            apply|stop|status|rules|stats|plan|rate-set|config-save|config-state|check|effective-rates|capacity|coverage)
                 ACTION="$1"
                 shift
                 ;;
@@ -365,10 +369,8 @@ compute_cburst() {
 }
 
 flower_ok() {
-    case "$FILTER_KIND" in
-        u32) return 1 ;;
-        flower) return 0 ;;
-    esac
+    [[ "$FILTER_KIND" != u32 ]] || return 1
+    [[ -d /sys/module/cls_flower ]] && return 0
     grep -qw cls_flower /proc/modules 2>/dev/null && return 0
     modinfo -F filename cls_flower >/dev/null 2>&1 && return 0
     return 1
@@ -382,12 +384,38 @@ filter_kind_label() {
     fi
 }
 
+ipv6_coverage_state() {
+    if ! ipv6_enabled; then
+        printf 'disabled\n'
+    elif flower_ok; then
+        printf 'covered\n'
+    else
+        printf 'uncovered\n'
+    fi
+}
+
+validate_ipv6_coverage() {
+    case "$IPV6_STRICT" in
+        yes|no) ;;
+        *) die "IPV6_STRICT 只能是 yes / no。" ;;
+    esac
+    if [[ "$FILTER_KIND" == flower ]] && ! flower_ok; then
+        die "FILTER_KIND=flower 已明确要求 flower，但未检测到 cls_flower；请检查内核模块。"
+    fi
+    if [[ "$(ipv6_coverage_state)" == uncovered ]]; then
+        if [[ "$IPV6_STRICT" == yes ]]; then
+            die "检测到 IPv6 需要限速，但当前分类器 $(filter_kind_label) 无法覆盖 IPv6；请安装 cls_flower、设置 FILTER_KIND=flower，或明确设置 IPV6_STRICT=no。"
+        fi
+        log "警告: IPv6 未被当前分类器覆盖，本次仅限速 IPv4（IPV6_STRICT=no）。" >&2
+    fi
+}
+
 nic_has_ipv6() {
     ip -6 addr show dev "$NIC" scope global 2>/dev/null | grep -q 'inet6'
 }
 
 ipv6_enabled() {
-    case "$IPV6_MODE" in
+    case "${IPV6_RESOLVED:-$IPV6_MODE}" in
         yes) return 0 ;;
         no) return 1 ;;
     esac
@@ -396,7 +424,7 @@ ipv6_enabled() {
 
 ipv6_label() {
     if ipv6_enabled; then
-        printf '已启用'
+        if flower_ok; then printf '计划启用（实际状态见 coverage）'; else printf '未覆盖（仅 IPv4）'; fi
     elif [[ "$IPV6_MODE" == "no" ]]; then
         printf '已关闭（IPV6_MODE=no）'
     else
@@ -571,8 +599,9 @@ build_plan() {
 base_signature() {
     {
         printf '%s\n' "$NIC" "$CLASS_START" "$R2Q" "$DEFAULT_RATE" "$DEFAULT_GUARANTEE" \
-            "$FILTER_KIND" "$IPV6_MODE" "$FILTER_PRIO" "$FILTER_PRIO6" "$FQ_CODEL" "$FQ_CODEL_OPTS" "$BURST" "$CBURST"
+            "$FILTER_KIND" "$IPV6_MODE" "$IPV6_STRICT" "$FILTER_PRIO" "$FILTER_PRIO6" "$FQ_CODEL" "$FQ_CODEL_OPTS" "$BURST" "$CBURST"
         cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf 'unknown\n'
+        if ipv6_enabled; then printf 'ipv6-required\n'; else printf 'ipv6-not-required\n'; fi
         local i
         for ((i=0;i<${#PARSE_START[@]};i++)); do
             printf '%s\t%s\t%s\t%s\n' "${PARSE_START[i]}" "${PARSE_END[i]}" "${PARSE_RATE[i]}" "${PARSE_MODE[i]}"
@@ -581,13 +610,54 @@ base_signature() {
 }
 
 applied_state_file() { printf '%s/%s.applied' "$LIMIT_STATE_DIR" "${NIC//\//_}"; }
+applied_batch_file() { printf '%s/%s.batch' "$LIMIT_STATE_DIR" "${NIC//\//_}"; }
+
+# Keep the generated topology, replacing class rates with the live policy rates.
+snapshot_live_batch() {
+    local source="$1" target="$2" rates
+    rates="$(class_rates)" || return 1
+    [[ -n "$rates" ]] || return 2
+    awk -v rates="$rates" '
+        BEGIN {
+            n=split(rates, rows, "\n")
+            for(i=1;i<=n;i++) { split(rows[i], r, "\t"); rate[r[1]]=r[2]; ceil[r[1]]=r[3] }
+        }
+        $1=="class" && $2=="add" {
+            id=""; for(i=1;i<NF;i++) if($i=="classid") id=$(i+1)
+            if(!(id in rate) || rate[id]<=0 || ceil[id]<=0) { bad=1; next }
+            for(i=1;i<NF;i++) {
+                if($i=="rate") $(i+1)=rate[id] "bit"
+                if($i=="ceil") $(i+1)=ceil[id] "bit"
+            }
+        }
+        { print }
+        END { exit bad }
+    ' "$source" >"$target"
+}
+
+restore_failed_apply() {
+    local restore="$1"
+    delete_root_qdisc
+    if [[ -s "$restore" ]] && tc -batch "$restore"; then
+        rm -f "$restore"
+        die "下发失败，已恢复上一套规则及策略速率；新配置仍未应用。"
+    fi
+    delete_root_qdisc
+    rm -f "$restore" "$(applied_state_file)" "$(applied_batch_file)"
+    die "下发失败；没有可恢复规则或恢复失败，已清理半套规则并回到不限速状态。"
+}
 
 config_state() {
     local signature saved file
     signature="$(base_signature)" || return 1
     file="$(applied_state_file)"
-    if [[ ! -r "$file" ]]; then printf 'unknown\n'; return; fi
-    saved="$(cat "$file")" || return 1
+    if [[ -r "$(applied_batch_file)" ]]; then
+        saved="$(sed -n 's/^# signature //p' "$(applied_batch_file)")" || return 1
+    elif [[ -r "$file" ]]; then
+        saved="$(cat "$file")" || return 1
+    else
+        printf 'unknown\n'; return
+    fi
     if [[ "$saved" == "$signature" ]]; then printf 'applied\n'; else printf 'pending\n'; fi
 }
 
@@ -647,6 +717,55 @@ capacity_report() {
         "$(total_ports)" "${#PLAN_ID[@]}" "$MAX_CLASSES" "${ACCT_MAX_PORTS:-512}"
 }
 
+coverage_report() {
+    local filters family actual state required=0
+    filters="$(tc filter show dev "$NIC" parent 1: 2>/dev/null)" || {
+        printf 'ipv4\tunknown\nipv6\tunknown\n'; return 1;
+    }
+    ipv6_enabled && required=1
+    state="$(config_state)"
+    for family in ip ipv6; do
+        # Verify every planned class has TCP and UDP filters in this family.
+        actual="$(printf '%s\n' "$filters" | awk -v family="$family" '
+            function flush() {
+                if(!active || id=="") return
+                if(proto=="tcp") tcp[id]=1
+                if(proto=="udp") udp[id]=1
+                if(u32) count[id]++
+            }
+            /^filter / {
+                flush(); active=0; id=""; proto=""; u32=0
+                for(i=1;i<=NF;i++) {
+                    if($i=="protocol" && $(i+1)==family) active=1
+                    if($i=="u32") u32=1
+                }
+            }
+            active { for(i=1;i<NF;i++) {
+                if($i=="flowid" || $i=="classid") id=$(i+1)
+                if($i=="ip_proto") proto=$(i+1)
+            } }
+            END {
+                flush()
+                for(id in tcp) if(udp[id]) print id
+                if(family=="ip") for(id in count) if(count[id]>=2) print id
+            }
+        ')"
+        local id covered=1
+        ((${#PLAN_ID[@]})) || covered=0
+        for id in "${PLAN_ID[@]}"; do
+            grep -Fxq "1:$id" <<<"$actual" || covered=0
+        done
+        local label=uncovered
+        (( covered )) && label=filters-present
+        [[ "$state" == applied ]] || label=pending-or-unknown
+        [[ "$family" != ip ]] || family=ipv4
+        printf '%s\t%s\n' "$family" "$label"
+    done
+    printf 'ipv6_required\t%s\n' "$required"
+    printf 'filter\t%s\n' "$(filter_kind_label)"
+    printf 'strict\t%s\n' "$IPV6_STRICT"
+}
+
 filter_count() {
     local i protos=2 families=1 per total=0
     if ipv6_enabled; then
@@ -667,6 +786,10 @@ validate_config() {
     local check_nic="${1:-1}"
 
     [[ -n "$NIC" ]] || die "NIC 不能为空。"
+    case "${ACCT_SCOPE:-all}" in
+        all|local|forward) ;;
+        *) die "ACCT_SCOPE 只能是 all / local / forward。" ;;
+    esac
     [[ "${ACCT_MAX_PORTS:-512}" =~ ^[1-9][0-9]{0,4}$ ]] &&
         (( ${ACCT_MAX_PORTS:-512} <= 65535 )) || die "ACCT_MAX_PORTS 必须是 1-65535。"
     is_uint "$CLASS_START" || die "CLASS_START 必须是整数。"
@@ -693,6 +816,10 @@ validate_config() {
     case "$IPV6_MODE" in
         auto|yes|no) ;;
         *) die "IPV6_MODE 只能是 auto / yes / no。" ;;
+    esac
+    case "$IPV6_STRICT" in
+        yes|no) ;;
+        *) die "IPV6_STRICT 只能是 yes / no。" ;;
     esac
 
     if [[ "$SPEC_SOURCE" == "配置 PORT_START/PORT_END" ]]; then
@@ -863,6 +990,8 @@ run_precheck() {
 
 apply_rules() {
     validate_config 1
+    if ipv6_enabled; then IPV6_RESOLVED=yes; else IPV6_RESOLVED=no; fi
+    validate_ipv6_coverage
     parse_spec "$SPEC_STRING"
     build_plan
 
@@ -896,25 +1025,37 @@ apply_rules() {
         fi
     fi
 
-    local state pending
+    local state pending old_batch restore_batch rc=0
     state="$(applied_state_file)"
+    old_batch="$(applied_batch_file)"
     install -d -m 0755 "$LIMIT_STATE_DIR" || die "无法创建生效状态目录。"
-    pending="$(mktemp "$LIMIT_STATE_DIR/.applied.XXXXXX")" || die "无法创建生效状态文件。"
-    base_signature >"$pending" || die "无法记录配置版本。"
+    pending="$(mktemp "$LIMIT_STATE_DIR/.batch.XXXXXX")" || die "无法创建生效状态文件。"
+    { printf '# signature %s\n' "$(base_signature)"; cat "$batch"; } >"$pending" || die "无法记录配置版本。"
     chmod 0644 "$pending"
-    rm -f "$state"
+    restore_batch="$(mktemp "$LIMIT_STATE_DIR/.restore.XXXXXX")" || die "无法创建恢复批次。"
+    if [[ -s "$old_batch" ]]; then
+        snapshot_live_batch "$old_batch" "$restore_batch" || rc=$?
+        if (( rc == 2 )); then
+            : >"$restore_batch"
+        elif (( rc != 0 )); then
+            rm -f "$pending" "$batch" "$restore_batch"
+            die "无法完整读取旧队列速率，保持现有限速不变。"
+        fi
+    fi
     log "清理 $NIC 上已有的 root qdisc..."
     delete_root_qdisc
 
     if ! tc -batch "$batch"; then
         rm -f "$batch"
         rm -f "$pending"
-        log "下发失败，回滚: 删除 root qdisc，回到不限速状态，避免留下半套规则..."
-        delete_root_qdisc
-        die "tc -batch 执行失败，已回滚。"
+        restore_failed_apply "$restore_batch"
     fi
     rm -f "$batch"
-    mv -f "$pending" "$state" || die "队列已应用，但生效状态保存失败，请重试。"
+    if ! mv -f "$pending" "$old_batch"; then
+        rm -f "$pending"
+        restore_failed_apply "$restore_batch"
+    fi
+    rm -f "$restore_batch" "$state"
 
     log "完成：${#PLAN_ID[@]} 个 HTB class，$(filter_count) 条 filter。"
     log "查看统计：tc -s class show dev $NIC"
@@ -927,12 +1068,13 @@ rate_set() {
         die "配置已被其他会话修改，未更新策略速率，请刷新后重试。"
     [[ -r "$RATE_FILE" ]] || die "找不到速率覆盖文件: $RATE_FILE"
     validate_config 1
+    validate_ipv6_coverage
     parse_spec "$SPEC_STRING"
     build_plan
     require_applied_config
 
     local -A override=() current_rate=() current_ceil=() desired_bps=()
-    local start end rate key i batch extra rule matched current id ceil commands=0
+    local start end rate key i batch rollback extra rule matched current id ceil commands=0
     while IFS=$'\t' read -r start end rate extra; do
         [[ -n "$start" && "$start" != '#'* ]] || continue
         [[ -z "${extra:-}" ]] || die "速率覆盖文件格式无效。"
@@ -963,21 +1105,29 @@ rate_set() {
         current_rate["$id"]="$rate" current_ceil["$id"]="$ceil"
     done <<<"$current"
     batch="$(mktemp "${TMPDIR:-/tmp}/limit-ports-rate.XXXXXX")" || die "无法创建临时文件。"
-    : >"$batch"
+    rollback="$(mktemp "${TMPDIR:-/tmp}/limit-ports-rate-restore.XXXXXX")" || {
+        rm -f "$batch"
+        die "无法创建速率恢复批次。"
+    }
+    : >"$batch"; : >"$rollback"
     for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
         rule="${PLAN_RULE[i]}"
         key="${PARSE_START[rule]}-${PARSE_END[rule]}"
         if [[ -n "${override[$key]:-}" ]]; then
             rate="${override[$key]}"
             id="1:${PLAN_ID[i]}"
-            if [[ -z "${current_rate[$id]:-}" ]]; then
-                rm -f "$batch"
+            if [[ ! "${current_rate[$id]:-}" =~ ^[1-9][0-9]*$ || ! "${current_ceil[$id]:-}" =~ ^[1-9][0-9]*$ ]]; then
+                rm -f "$batch" "$rollback"
                 die "缺少限速队列 $id，请先应用基础规则。"
             fi
             if [[ "${current_rate[$id]}" == "${desired_bps[$key]}" &&
                   "${current_ceil[$id]}" == "${desired_bps[$key]}" ]]; then
                 continue
             fi
+            cache_rates "${current_rate[$id]}bit" "${current_ceil[$id]}bit"
+            printf 'class change dev %s parent 1: classid 1:%s htb rate %sbit ceil %sbit burst %s cburst %s\n' \
+                "$NIC" "${PLAN_ID[i]}" "${current_rate[$id]}" "${current_ceil[$id]}" \
+                "$(compute_burst "${current_rate[$id]}bit")" "$(compute_cburst "${current_ceil[$id]}bit")" >>"$rollback"
             printf 'class change dev %s parent 1: classid 1:%s htb rate %s ceil %s burst %s cburst %s\n' \
                 "$NIC" "${PLAN_ID[i]}" "$rate" "$rate" \
                 "$(compute_burst "$rate")" "$(compute_cburst "$rate")" >>"$batch"
@@ -985,15 +1135,21 @@ rate_set() {
         fi
     done
     if [[ ! -s "$batch" ]]; then
-        rm -f "$batch"
+        rm -f "$batch" "$rollback"
         log "策略速率未变化，无需更新队列。"
         return 0
     fi
-    tc -batch "$batch" || {
+    if ! tc -batch "$batch"; then
         rm -f "$batch"
-        die "速率覆盖应用失败，部分队列可能已更新；请重试或重新应用基础规则。"
-    }
-    rm -f "$batch"
+        if tc -batch "$rollback"; then
+            rm -f "$rollback"
+            die "速率覆盖应用失败，已恢复上一套队列速率。"
+        fi
+        rm -f "$rollback"
+        rm -f "$(applied_state_file)" "$(applied_batch_file)"
+        die "速率覆盖应用失败，且上一套队列速率恢复失败；请重新应用基础规则。"
+    fi
+    rm -f "$batch" "$rollback"
     log "已更新 $commands 个队列（${#override[@]} 条策略速率覆盖）。"
 }
 
@@ -1049,6 +1205,7 @@ collect_stats() {
 
 plan_rules() {
     validate_config 0
+    validate_ipv6_coverage
     parse_spec "$SPEC_STRING"
     build_plan
 
@@ -1098,7 +1255,7 @@ stop_rules() {
     ip link show dev "$NIC" >/dev/null 2>&1 || die "网卡不存在: $NIC"
     log "删除 $NIC 的 root qdisc..."
     delete_root_qdisc
-    rm -f "$(applied_state_file)"
+    rm -f "$(applied_state_file)" "$(applied_batch_file)"
     log "已停止。"
 }
 
@@ -1108,6 +1265,9 @@ status_rules() {
     require_command ip
     ip link show dev "$NIC" >/dev/null 2>&1 || die "网卡不存在: $NIC"
     printf 'limit_ports.sh %s\n' "$LIMIT_PORTS_VERSION"
+    parse_spec "$SPEC_STRING"
+    build_plan
+    coverage_report || true
     tc -s qdisc show dev "$NIC"
     tc -s class show dev "$NIC"
 }
@@ -1211,7 +1371,7 @@ main() {
             require_root
             with_config_lock save_config
             ;;
-        config-state|effective-rates|capacity|check)
+        config-state|effective-rates|capacity|coverage|check)
             resolve_spec
             validate_config 0
             parse_spec "$SPEC_STRING"
@@ -1220,6 +1380,7 @@ main() {
                 config-state) config_state ;;
                 effective-rates) effective_rates ;;
                 capacity) capacity_report ;;
+                coverage) coverage_report ;;
                 check)
                     local count
                     count="$(total_ports)"

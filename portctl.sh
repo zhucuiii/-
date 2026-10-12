@@ -1088,6 +1088,7 @@ ACCT_SERVICE_FILE="${ACCT_SERVICE_FILE:-/etc/systemd/system/portctl-accounting.s
 ACCT_TIMER_FILE="${ACCT_TIMER_FILE:-/etc/systemd/system/portctl-accounting.timer}"
 ACCT_TIMER_NAME="portctl-accounting.timer"
 ACCT_MAX_PORTS="${ACCT_MAX_PORTS:-512}"
+ACCT_SCOPE="${ACCT_SCOPE:-all}"
 ACCT_LOCK_FILE="${ACCT_LOCK_FILE:-$ACCT_DIR/accounting.lock}"
 # 临时的 stderr 暂存文件，只用于把诊断信息和数据分开
 ACCT_ERR_FILE="${ACCT_ERR_FILE:-${TMPDIR:-/tmp}/portctl-acct-err.$$}"
@@ -1151,11 +1152,28 @@ acct_capacity_check() {
     }
 }
 
+acct_scope_label() {
+    case "$ACCT_SCOPE" in
+        all) printf '全部匹配流量' ;;
+        local) printf '本机服务流量' ;;
+        forward) printf '转发流量' ;;
+        *) printf '无效' ;;
+    esac
+}
+
+acct_validate_scope() {
+    case "$ACCT_SCOPE" in
+        all|local|forward) return 0 ;;
+        *) printf '[acct] ACCT_SCOPE 只能是 all / local / forward。\n' >&2; return 1 ;;
+    esac
+}
+
 acct_build_script() {
     local -a ports=()
     local p els_up="" els_down=""
     readarray -t ports < <(acct_ports) || return 1
     ((${#ports[@]})) || return 1
+    acct_validate_scope || return 1
 
     for p in "${ports[@]}"; do
         els_up+="${els_up:+, }$p : \"up_$p\""
@@ -1169,21 +1187,26 @@ acct_build_script() {
     generation="${generation//_/}"
     printf 'table inet %s {\n' "$ACCT_TABLE"
     printf '    counter generation_%s {\n    }\n' "$generation"
+    printf '    counter scope_%s {\n    }\n' "$ACCT_SCOPE"
     for p in "${ports[@]}"; do
         printf '    counter up_%s {\n    }\n' "$p"
         printf '    counter down_%s {\n    }\n' "$p"
     done
     printf '    map up {\n        type inet_service : counter\n        elements = { %s }\n    }\n' "$els_up"
     printf '    map down {\n        type inet_service : counter\n        elements = { %s }\n    }\n' "$els_down"
+    local up_hook down_hook
+    case "$ACCT_SCOPE" in
+        all) up_hook='prerouting priority -150'; down_hook='postrouting priority 150' ;;
+        local) up_hook='input priority -150'; down_hook='output priority -150' ;;
+        forward) up_hook='forward priority -150'; down_hook='forward priority -150' ;;
+    esac
     printf '    chain pre {\n'
-    printf '        type filter hook prerouting priority -150; policy accept;\n'
-    printf '        counter name tcp dport map @up\n'
-    printf '        counter name udp dport map @up\n'
+    printf '        type filter hook %s; policy accept;\n' "$up_hook"
+    printf '        counter name tcp dport map @up\n        counter name udp dport map @up\n'
     printf '    }\n'
     printf '    chain post {\n'
-    printf '        type filter hook postrouting priority 150; policy accept;\n'
-    printf '        counter name tcp sport map @down\n'
-    printf '        counter name udp sport map @down\n'
+    printf '        type filter hook %s; policy accept;\n' "$down_hook"
+    printf '        counter name tcp sport map @down\n        counter name udp sport map @down\n'
     printf '    }\n'
     printf '}\n'
 }
@@ -1193,7 +1216,8 @@ acct_setup_locked() {
         printf '找不到 nft 命令，无法建立流量统计。\n' >&2
         return 1
     }
-    load_rules || true
+    load_rules || { printf '[acct] 无法读取端口配置。\n' >&2; return 1; }
+    acct_validate_scope || return 1
     acct_capacity_check || return 1
     if (( ${#RULE_IDX[@]} == 0 )); then
         printf '当前没有任何端口规则，请先在 [01] 里配置限速端口。\n' >&2
@@ -1239,7 +1263,7 @@ acct_setup_locked() {
         return 1
     fi
 
-    printf '统计规则已建立: %s 个端口 × 2 个方向。\n' "$n"
+    printf '统计规则已建立: %s 个端口 × 2 个方向，范围: %s（ACCT_SCOPE=%s）。\n' "$n" "$(acct_scope_label)" "$ACCT_SCOPE"
     return 0
 }
 
@@ -1258,6 +1282,7 @@ acct_remove_locked() {
 # counts have already overtaken the previous snapshot.
 acct_read_counters() {
     local out rc=0 expected tables boot
+    acct_validate_scope || return 1
     out="$(nft list counters table inet "$ACCT_TABLE" 2>&1)" || rc=$?
 
     if (( rc != 0 )); then
@@ -1280,7 +1305,8 @@ acct_read_counters() {
         expected="$(acct_ports)" || return 1
     fi
     boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" || boot=unknown
-    if ! printf '%s\n' "$out" | LC_ALL=C awk -v expected="$expected" -v legacy="legacy_$boot" '
+    if ! printf '%s\n' "$out" | LC_ALL=C awk -v expected="$expected" -v legacy="legacy_$boot" \
+        -v scope="$ACCT_SCOPE" -v skip="${ACCT_SKIP_EXPECTED:-0}" '
         BEGIN {
             n=split(expected, ports, "\n")
             for(i=1;i<=n;i++) if(ports[i]!="") want[ports[i]]=1
@@ -1288,13 +1314,14 @@ acct_read_counters() {
         /^[[:space:]]*counter / {
             if(name!="") bad=1
             name = $2
-            if(name !~ /^(up|down)_[0-9]+$/ && name !~ /^generation_[a-zA-Z0-9]+$/) bad=1
+            if(name !~ /^(up|down)_[0-9]+$/ && name !~ /^generation_[a-zA-Z0-9]+$/ && name !~ /^scope_(all|local|forward)$/) bad=1
             if(names[name]++) bad=1
             next
         }
         /^[[:space:]]*packets / {
             if(name=="" || $2 !~ /^[0-9]+$/ || $3!="bytes" || $4 !~ /^[0-9]+$/) { bad=1; next }
             if(name ~ /^generation_/) { generation=name; generations++; name=""; next }
+            if(name ~ /^scope_/) { actual=name; sub(/^scope_/, "", actual); scopes++; name=""; next }
             split(name, part, "_")
             p = part[2]
             if(p<1 || p>65535 || $4+0>9e15) bad=1
@@ -1303,16 +1330,18 @@ acct_read_counters() {
             name = ""
         }
         END {
-            if(name!="" || generations>1) bad=1
+            if(actual=="") actual="all"
+            if(name!="" || generations>1 || scopes>1 || (skip!=1 && actual!=scope)) bad=1
             for(p in hasup) if(!(p in hasdown) || (expected!="" && !(p in want))) bad=1
             for(p in hasdown) if(!(p in hasup)) bad=1
             for(p in want) if(!(p in hasup) || !(p in hasdown)) bad=1
             if(bad) exit 1
             printf "#GENERATION\t%s\n", generation!="" ? generation : legacy
+            printf "#SCOPE\t%s\n", actual
             for(p in hasup) printf "%s\t%.0f\t%.0f\n",p,up[p],down[p]
         }
     '; then
-        printf '[acct] 计数器缺失、端口不匹配或输出损坏，请建立 / 重建统计。\n' >&2
+        printf '[acct] 计数器缺失、端口或统计范围不匹配、输出损坏，请建立 / 重建统计（ACCT_SCOPE=%s）。\n' "$ACCT_SCOPE" >&2
         return 1
     fi
 }
@@ -1373,12 +1402,27 @@ acct_save_snapshot() {
     install -d -m 0755 "$ACCT_DIR" || return 1
     tmp="$(mktemp "$ACCT_DIR/traffic.XXXXXX")" || return 1
     if ! {
+        printf '#SCOPE\t%s\n' "$(acct_history_scope "$live" "$reset")" &&
         printf '# port\tup_bytes\tdown_bytes\tupdated\tgeneration\traw_up\traw_down\n' &&
         acct_snapshot_rows "$live" "$reset"
     } >"$tmp" || ! mv -f "$tmp" "$ACCT_FILE"; then
         rm -f "$tmp"
         printf '[acct] 保存失败，内核计数未清零，下次采样可重试。\n' >&2
         return 1
+    fi
+}
+
+acct_history_scope() {
+    local live="${1:-}" reset="${2:-0}" previous=none actual
+    if [[ -f "$ACCT_FILE" ]]; then
+        previous="$(awk -F'\t' '$1=="#SCOPE"{print $2; found=1} END{if(!found) print "all"}' "$ACCT_FILE")"
+    fi
+    actual="$(awk -F'\t' '$1=="#SCOPE"{print $2}' <<<"$live")"
+    [[ -n "$actual" ]] || { printf '%s\n' "$previous"; return; }
+    if [[ "$reset" == 1 || "$previous" == none || "$previous" == "$actual" ]]; then
+        printf '%s\n' "$actual"
+    else
+        printf 'mixed\n'
     fi
 }
 
@@ -1501,6 +1545,7 @@ acct_rows_for_menu() {
 
     printf '%s' "$rows"
     printf '#TOTAL\t%s\t%s\n' "$tot_u" "$tot_d"
+    printf '#SCOPE\t%s\t%s\n' "$ACCT_SCOPE" "$(acct_history_scope)"
     return "$rc"
 }
 
@@ -1529,6 +1574,10 @@ show_traffic_accounting() {
 
         rows="$(printf '%s\n' "$data" | grep '^[0-9]' || true)"
         total_line="$(printf '%s\n' "$data" | grep '^#TOTAL' || true)"
+        local scope_line configured history
+        scope_line="$(printf '%s\n' "$data" | grep '^#SCOPE' || true)"
+        IFS=$'\t' read -r _ configured history <<<"$scope_line"
+        printf '  配置统计范围: %s；历史累计范围: %s（mixed 表示跨范围累计，重建保留历史）。\n' "${configured:-unknown}" "${history:-unknown}"
 
         if (( acct_rc != 0 )) || [[ -n "$acct_err" ]]; then
             printf '\n%s读取累计数据时有问题:%s\n%s\n' "$YELLOW" "$RESET" "$acct_err"

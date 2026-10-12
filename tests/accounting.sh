@@ -13,7 +13,7 @@ export ACCT_TABLE="portctl_acct"
 export ACCT_ERR_FILE="$TMP/acct.err"
 export NFT_CALLS="$TMP/nft.calls"
 export NFT_SCENARIO="missing"
-export NFT_UP_BYTES=30 NFT_DOWN_BYTES=40 NFT_GENERATION=""
+export NFT_UP_BYTES=30 NFT_DOWN_BYTES=40 NFT_GENERATION="" NFT_SCOPE=""
 printf 'PORT_SPEC="8080=12mbit"\n' >"$CONFIG_FILE"
 
 # Load the functions without opening the interactive menu.
@@ -45,6 +45,9 @@ nft() {
                     [[ "$NFT_SCENARIO" != wrong-port ]] || port=8443
                     [[ "$NFT_SCENARIO" != malformed ]] || up=invalid
                     printf 'table inet portctl_acct {\n'
+                    if [[ -n "$NFT_SCOPE" ]]; then
+                        printf '    counter scope_%s {\n        packets 0 bytes 0\n    }\n' "$NFT_SCOPE"
+                    fi
                     if [[ -n "$NFT_GENERATION" ]]; then
                         printf '    counter generation_%s {\n        packets 0 bytes 0\n    }\n' "$NFT_GENERATION"
                     fi
@@ -90,7 +93,7 @@ fail() {
     exit 1
 }
 assert_output() {
-    [[ "$(cat "$TMP/out")" == "$1" ]] || fail "unexpected output: $(cat "$TMP/out")"
+    [[ "$(sed '/^#SCOPE/d' "$TMP/out")" == "$1" ]] || fail "unexpected output: $(cat "$TMP/out")"
 }
 assert_quiet() {
     [[ ! -s "$TMP/err" ]] || fail "unexpected stderr: $(cat "$TMP/err")"
@@ -240,5 +243,35 @@ NFT_UP_BYTES=330 NFT_DOWN_BYTES=410
 [[ "$(acct_current)" == $'8080\t30\t10' ]] || fail "post-reset traffic used the wrong baseline"
 if grep -q '^reset ' "$NFT_CALLS"; then fail "logical reset cleared kernel counters"; fi
 pass "logical reset preserves counter baselines and counts subsequent traffic"
+
+for scope in all local forward; do
+    ACCT_SCOPE="$scope"
+    acct_build_script >"$TMP/rules.nft"
+    grep -q "counter scope_$scope" "$TMP/rules.nft" || fail "missing scope metadata"
+    case "$scope" in
+        all) grep -q 'hook prerouting priority -150' "$TMP/rules.nft" || fail "legacy hook changed" ;;
+        local) grep -q 'hook input priority -150' "$TMP/rules.nft" || fail "local ingress not input"
+               grep -q 'hook output priority -150' "$TMP/rules.nft" || fail "local egress not output" ;;
+        forward) [[ "$(grep -c 'hook forward priority -150' "$TMP/rules.nft")" == 2 ]] || fail "forward traffic not isolated" ;;
+    esac
+done
+pass "accounting scopes generate explicit metadata and routing hooks"
+
+ACCT_SCOPE=local NFT_SCOPE=all
+assert_read_failure
+ACCT_SCOPE=local NFT_SCOPE=local
+acct_read_counters >"$TMP/out"
+grep -Fxq $'#SCOPE\tlocal' "$TMP/out" || fail "live scope missing"
+acct_sample
+grep -Fxq $'#SCOPE\tmixed' "$ACCT_FILE" || fail "scope switch hid historical accounting range"
+acct_reset
+grep -Fxq $'#SCOPE\tlocal' "$ACCT_FILE" || fail "reset did not start a new scope history"
+NFT_SCOPE=forward
+assert_read_failure
+ACCT_SKIP_EXPECTED=1 acct_read_counters >"$TMP/out"
+grep -Fxq $'#SCOPE\tforward' "$TMP/out" || fail "migration cannot sample old scope"
+ACCT_SCOPE=invalid
+if acct_build_script >"$TMP/out" 2>"$TMP/err"; then fail "invalid accounting scope accepted"; fi
+pass "scope mismatches refuse sampling while explicit migrations retain labeled history"
 
 printf 'Passed %s accounting tests.\n' "$passed"

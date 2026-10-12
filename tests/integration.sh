@@ -58,6 +58,50 @@ grep -Fxq $'10001\t10003\t5mbit' <<<"$effective" || fail "live independent rate 
 grep -Fxq $'20000\t20001\t7mbit' <<<"$effective" || fail "live shared rate not reported"
 pass "pending configs cannot change old classes and live rates reflect the kernel"
 
+(
+    source <(sed '$d' "$LIMIT_SCRIPT")
+    PRECHECK=no
+    resolve_spec
+    tc() {
+        if [[ "$1" == -batch && "${INJECT_FAILURE:-0}" == 1 ]]; then
+            INJECT_FAILURE=0
+            head -n 3 "$2" >"$TMP/partial.batch"
+            command tc -batch "$TMP/partial.batch"
+            return 1
+        fi
+        command tc "$@"
+    }
+    INJECT_FAILURE=1
+    SPEC_STRING='30000=10mbit'
+    if (apply_rules) >"$TMP/error" 2>&1; then fail "injected apply failure succeeded"; fi
+    grep -q '已恢复上一套规则及策略速率' "$TMP/error" || fail "real kernel rollback failed"
+)
+[[ "$(bash "$LIMIT_SCRIPT" effective-rates)" == "$effective" ]] || fail "rollback lost live policy rates"
+[[ "$(tc filter show dev pctest0 parent 1:)" == "$filters" ]] || fail "rollback lost filters"
+bash "$LIMIT_SCRIPT" coverage >"$TMP/coverage"
+grep -Fxq $'ipv6\tfilters-present' "$TMP/coverage" || fail "live IPv6 filters not recognized"
+pass "failed real tc replacement restores filters and live policy rates"
+
+(
+    source <(sed '$d' "$LIMIT_SCRIPT")
+    resolve_spec
+    tc() {
+        if [[ "$1" == -batch && "${INJECT_FAILURE:-0}" == 1 ]]; then
+            INJECT_FAILURE=0
+            head -n 1 "$2" >"$TMP/partial-rate.batch"
+            command tc -batch "$TMP/partial-rate.batch"
+            return 1
+        fi
+        command tc "$@"
+    }
+    printf '10001\t10003\t2mbit\n20000\t20001\t3mbit\n' >"$TMP/fail.rates"
+    RATE_FILE="$TMP/fail.rates" INJECT_FAILURE=1
+    if (rate_set) >"$TMP/error" 2>&1; then fail "injected rate failure succeeded"; fi
+    grep -q '已恢复上一套队列速率' "$TMP/error" || fail "real rate restore failed"
+)
+[[ "$(bash "$LIMIT_SCRIPT" effective-rates)" == "$effective" ]] || fail "partial rate failure changed effective rates"
+pass "partial real rate-set failure restores all previous ceilings"
+
 source "$ROOT/portctl.sh" --help >/dev/null
 trap 'rm -rf "$TMP"' EXIT
 load_rules
@@ -79,6 +123,104 @@ after="$(acct_current)"
 acct_reset
 awk -F'\t' '$2!=0 || $3!=0 {bad=1} END {exit bad}' <<<"$(acct_current)" || fail "logical reset failed"
 pass "real nft counters persist once, survive rebuilds, and reset logical totals"
+
+# Two private peers route through this disposable namespace. No host netns names.
+unshare -n sleep 300 & client=$!
+unshare -n sleep 300 & server=$!
+cleanup_peers() { kill "$client" "$server" 2>/dev/null || true; wait "$client" "$server" 2>/dev/null || true; }
+trap 'cleanup_peers; rm -rf "$TMP"' EXIT
+for pid in "$client" "$server"; do
+    for ((attempt=0;attempt<100;attempt++)); do
+        [[ "$(readlink "/proc/$pid/ns/net")" != "$(readlink /proc/self/ns/net)" ]] && break
+        sleep 0.01
+    done
+done
+ip link add routec type veth peer name peerc
+ip link add routes type veth peer name peers
+ip link set peerc netns "$client"
+ip link set peers netns "$server"
+sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+for side in c s; do
+    if [[ "$side" == c ]]; then pid="$client"; subnet=1; else pid="$server"; subnet=2; fi
+    ip link set "route$side" up
+    ip addr add "198.18.$subnet.1/24" dev "route$side"
+    ip -6 addr add "fd18:$subnet::1/64" dev "route$side" nodad
+    nsenter -t "$pid" -n ip link set lo up
+    nsenter -t "$pid" -n ip link set "peer$side" up
+    nsenter -t "$pid" -n ip addr add "198.18.$subnet.2/24" dev "peer$side"
+    nsenter -t "$pid" -n ip -6 addr add "fd18:$subnet::2/64" dev "peer$side" nodad
+    nsenter -t "$pid" -n ip route add default via "198.18.$subnet.1"
+    nsenter -t "$pid" -n ip -6 route add default via "fd18:$subnet::1"
+done
+send_udp() {
+    nsenter -t "$1" -n python3 - "$2" "$3" <<'PY'
+import socket, sys
+family = socket.AF_INET6 if ':' in sys.argv[1] else socket.AF_INET
+with socket.socket(family, socket.SOCK_DGRAM) as s:
+    s.bind(('::' if family == socket.AF_INET6 else '0.0.0.0', 10002))
+    s.sendto(b'accounting-test', (sys.argv[1], int(sys.argv[2])))
+PY
+    sleep 0.1
+}
+assert_counts() {
+    local rows
+    rows="$(acct_current)"
+    awk -F'\t' -v port="$1" -v positive="$2" '
+        $1==port { found=1; if(positive==1 && $2<=0) exit 1; if(positive==0 && $2!=0) exit 1 }
+        END {if(!found) exit 1}
+    ' <<<"$rows" || fail "unexpected scope=$ACCT_SCOPE count at port $1: $rows"
+}
+assert_download() {
+    local rows
+    rows="$(acct_current)"
+    awk -F'\t' -v positive="$1" '
+        $1==10002 {found=1; if(positive==1 && $3<=0) exit 1; if(positive==0 && $3!=0) exit 1}
+        END {if(!found) exit 1}
+    ' <<<"$rows" || fail "unexpected download count in scope $ACCT_SCOPE: $rows"
+}
+for ACCT_SCOPE in local forward; do
+    if acct_current >"$TMP/error" 2>&1; then fail "scope switch used old table without rebuilding"; fi
+    acct_setup
+    acct_reset
+    printf 'local4\n' >/dev/udp/127.0.0.1/10001
+    printf 'local6\n' >/dev/udp/::1/10003
+    if [[ "$ACCT_SCOPE" == local ]]; then expected=1; else expected=0; fi
+    assert_counts 10001 "$expected"
+    assert_counts 10003 "$expected"
+    acct_reset
+    send_udp "$client" 198.18.2.2 10001
+    send_udp "$client" fd18:2::2 10003
+    if [[ "$ACCT_SCOPE" == forward ]]; then expected=1; else expected=0; fi
+    assert_counts 10001 "$expected"
+    assert_counts 10003 "$expected"
+    assert_download "$expected"
+done
+pass "local/forward scopes separate IPv4 and IPv6 local and routed packets"
+
+nft -f - <<'EOF'
+table ip test_nat {
+    chain pre {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip daddr 198.18.1.1 udp dport 20000 dnat to 198.18.2.2:10001
+    }
+}
+EOF
+for ACCT_SCOPE in all local forward; do
+    acct_setup
+    acct_reset
+    send_udp "$client" 198.18.1.1 20000
+    case "$ACCT_SCOPE" in
+        all) assert_counts 20000 1; assert_counts 10001 0 ;;
+        local) assert_counts 20000 0; assert_counts 10001 0 ;;
+        forward) assert_counts 20000 0; assert_counts 10001 1 ;;
+    esac
+done
+nft delete table ip test_nat
+ACCT_SCOPE=all
+acct_setup
+cleanup_peers
+trap 'rm -rf "$TMP"' EXIT
+pass "DNAT accounting uses external ports for all and translated ports for forward, excluding local"
 
 printf '1\tmonthly\t10001\t10003\t1000000000\t1mbit\tmonth\t-\n' >"$POLICY_CONF"
 nft delete table inet "$ACCT_TABLE"

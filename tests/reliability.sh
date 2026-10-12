@@ -75,6 +75,132 @@ pass "independent and shared ranges update fully, unchanged rates skip tc, and i
 
 (
     source <(sed '$d' "$ROOT/limit_ports.sh")
+    require_root() { :; }
+    config_state() { printf 'applied\n'; }
+    ip() { return 0; }
+    tc() {
+        case "$*" in
+            "class show dev eth0") printf 'class htb 1:10 parent 1: rate 12Mbit ceil 12Mbit\n' ;;
+            "-batch "*)
+                n=${TC_BATCH_COUNT:-0}; TC_BATCH_COUNT=$((n + 1))
+                cp "$2" "$TMP/rate-batch-$TC_BATCH_COUNT"
+                (( TC_BATCH_COUNT == 1 )) && return 1
+                return 0
+                ;;
+            *) fail "unexpected tc command during rollback: $*" ;;
+        esac
+    }
+    SPEC_STRING='8080=12mbit'
+    parse_spec "$SPEC_STRING"; build_plan
+    RATE_FILE="$TMP/rollback-rates"
+    printf '8080\t8080\t5mbit\n' >"$RATE_FILE"
+    if (rate_set) >"$TMP/rollback.out" 2>&1; then fail "failed rate update reported success"; fi
+    grep -q 'classid 1:10 htb rate 12000000bit ceil 12000000bit' "$TMP/rate-batch-2" || fail "rollback did not restore old rate"
+)
+pass "failed rate updates replay the previous queue rates"
+
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
+    NIC=eth0 FILTER_KIND=u32 IPV6_MODE=yes IPV6_STRICT=yes
+    ip() { printf '    inet6 2001:db8::1/64 scope global\n'; }
+    if (validate_ipv6_coverage) >"$TMP/ipv6.out" 2>&1; then fail "strict IPv6 coverage accepted u32-only shaping"; fi
+    grep -q 'IPV6_STRICT' "$TMP/ipv6.out" || fail "strict IPv6 diagnostic omitted remediation"
+    IPV6_STRICT=no
+    validate_ipv6_coverage >"$TMP/ipv6-warning" 2>&1
+    grep -q '仅限速 IPv4' "$TMP/ipv6-warning" || fail "non-strict IPv6 downgrade was not reported"
+)
+pass "IPv6 coverage checks reject silent u32-only enforcement and report explicit downgrade"
+
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
+    FILTER_KIND=flower IPV6_MODE=no IPV6_STRICT=yes NIC=eth0
+    flower_ok() { return 1; }
+    if (validate_ipv6_coverage) >"$TMP/flower.out" 2>&1; then fail "explicit flower requirement was silently downgraded"; fi
+    grep -q 'FILTER_KIND=flower' "$TMP/flower.out" || fail "missing explicit flower diagnostic"
+)
+pass "explicit flower selection fails when cls_flower is unavailable"
+
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
+    LIMIT_STATE_DIR="$TMP/restore-state"
+    NIC=eth0 FILTER_KIND=u32 IPV6_MODE=no PRECHECK=no
+    ip() { :; }
+    tc() {
+        case "$*" in
+            'qdisc del '*) return 0 ;;
+            'class show '*) printf 'class htb 1:1 root rate 1Mbit ceil 1000Mbit\nclass htb 1:10 parent 1: rate 5Mbit ceil 5Mbit\n' ;;
+            '-batch '*)
+                cp "$2" "$TMP/last-apply.batch"
+                if [[ "${FAIL_APPLY:-0}" == 1 ]]; then FAIL_APPLY=0; return 1; fi
+                [[ "${FAIL_RESTORE:-0}" != 1 ]]
+                ;;
+            *) fail "unexpected tc request: $*" ;;
+        esac
+    }
+    SPEC_STRING='8080=12mbit'
+    apply_rules >"$TMP/restore.out"
+    cp "$(applied_batch_file)" "$TMP/saved.batch"
+    SPEC_STRING='8443=20mbit'
+    FAIL_APPLY=1
+    if (apply_rules) >"$TMP/restore.out" 2>&1; then fail "failed apply returned success"; fi
+    grep -q 'sport 8080' "$TMP/last-apply.batch" || fail "old port filters not restored"
+    grep -q 'classid 1:10 htb rate 5000000bit ceil 5000000bit' "$TMP/last-apply.batch" || fail "old policy rate lost during rollback"
+    cmp -s "$(applied_batch_file)" "$TMP/saved.batch" || fail "rollback changed old snapshot"
+    parse_spec "$SPEC_STRING"; build_plan
+    [[ "$(config_state)" == pending ]] || fail "failed new config marked applied"
+    FAIL_RESTORE=1
+    if (apply_rules) >"$TMP/restore.out" 2>&1; then fail "failed restore returned success"; fi
+    [[ ! -f "$(applied_batch_file)" ]] || fail "failed restore kept a trusted snapshot"
+    if (apply_rules) >"$TMP/restore.out" 2>&1; then fail "first apply failure returned success"; fi
+    [[ "$(config_state)" == unknown ]] || fail "first apply failure marked applied"
+)
+pass "base apply failures restore old ports and live policy rates, and failed recovery invalidates state"
+
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
+    LIMIT_STATE_DIR="$TMP/ipv6-state"
+    mkdir -p "$LIMIT_STATE_DIR"
+    IPV6_MODE=auto
+    nic_has_ipv6() { [[ "${HAS_IPV6:-0}" == 1 ]]; }
+    SPEC_STRING='8080=12mbit'
+    parse_spec "$SPEC_STRING"; build_plan
+    base_signature >"$(applied_state_file)"
+    [[ "$(config_state)" == applied ]] || fail "initial IPv4 config not applied"
+    HAS_IPV6=1
+    [[ "$(config_state)" == pending ]] || fail "IPv6 address appearance did not invalidate IPv4-only state"
+)
+pass "auto IPv6 address changes mark the previous rules pending"
+
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
+    LIMIT_STATE_DIR="$TMP/coverage-state"
+    mkdir -p "$LIMIT_STATE_DIR"
+    IPV6_MODE=yes FILTER_KIND=flower
+    flower_ok() { return 0; }
+    SPEC_STRING='8080=12mbit'
+    parse_spec "$SPEC_STRING"; build_plan
+    validate_ipv6_coverage
+    base_signature >"$(applied_state_file)"
+    tc() {
+        printf 'filter parent 1: protocol ipv6 pref 11 flower handle 0x1\n  ip_proto tcp\n  classid 1:10\n'
+        if [[ "${HAS_UDP:-0}" == 1 ]]; then
+            printf 'filter parent 1: protocol ipv6 pref 11 flower handle 0x2\n  ip_proto udp\n  classid 1:10\n'
+        fi
+    }
+    coverage_report >"$TMP/coverage"
+    grep -Fxq $'ipv6\tuncovered' "$TMP/coverage" || fail "missing UDP filter presented as covered"
+    HAS_UDP=1
+    coverage_report >"$TMP/coverage"
+    grep -Fxq $'ipv6\tfilters-present' "$TMP/coverage" || fail "installed TCP/UDP filters not recognized"
+    IPV6_MODE=auto
+    nic_has_ipv6() { return 1; }
+    build_batch "$TMP/no-v6.batch"
+    if grep -q 'protocol ipv6' "$TMP/no-v6.batch"; then fail "auto mode without IPv6 generated IPv6 filters"; fi
+)
+pass "IPv6 coverage inspects installed TCP/UDP filters and auto skips absent addresses"
+
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
     LIMIT_LOCK_DIR="$TMP/locks"
     critical() {
         printf '%s-start\n' "$1" >>"$TMP/lock.trace"

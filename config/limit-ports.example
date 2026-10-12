@@ -34,11 +34,18 @@ R2Q="100"
 
 # ---- 一般不需要改 ----
 # auto | flower | u32   flower 支持端口区间和 IPv6；u32 只支持 IPv4 且需逐端口。
-# 内核不支持 flower 时会自动回退。
+# auto 在内核不支持 flower 时回退；显式 flower 不允许回退。
 # FILTER_KIND="auto"
 
 # auto | yes | no   是否同时对 IPv6 限速，auto = 网卡有全局 IPv6 地址时才启用。
 # IPV6_MODE="auto"
+# IPv6 需要限速但分类器不支持时是否拒绝应用；yes 可避免 IPv6 绕过限速。
+# IPV6_STRICT="yes"
+
+# 流量统计范围：all=所有匹配流量（兼容旧行为），local=本机服务，forward=转发流量。
+# local 使用 input/output；forward 使用 forward；all 使用 prerouting/postrouting。
+# 修改范围后必须重建统计；历史总量保留，跨范围累计标记 mixed，不会自动清零。
+# ACCT_SCOPE="all"
 
 # IPv4 与 IPv6 必须使用不同的 filter prio，否则内核会返回 ENOENT。
 # FILTER_PRIO="10"

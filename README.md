@@ -104,6 +104,7 @@ sudo /usr/local/sbin/limit_ports.sh stop
 sudo /usr/local/sbin/limit_ports.sh config-state     # applied / pending / unknown
 sudo /usr/local/sbin/limit_ports.sh effective-rates  # 从实际队列读取生效速率
 sudo /usr/local/sbin/limit_ports.sh capacity         # 队列和统计容量
+sudo /usr/local/sbin/limit_ports.sh coverage         # IPv4/IPv6 覆盖检查
 sudo /usr/local/sbin/limit_ports.sh check            # 校验配置
 ```
 
@@ -216,8 +217,14 @@ sudo ./portctl.sh
     统计规则: 已建立    自动采样: 未开启
   ```
 
-  - **上行 = 用户上传**：`prerouting` 链上 `dport` = 该用户的端口（用户发给服务器的）
-  - **下行 = 用户下载**：`postrouting` 链上 `sport` = 该用户的端口（服务器发给用户的）
+  - **上行 / 下行按端口方向计数**：目标端口 `dport` 匹配计入上行，源端口 `sport` 匹配计入下行。字节数包含 IP 层开销，不是应用净载荷；重传、丢弃前已经过统计 hook 的报文也可能计入。
+  - **范围由 `ACCT_SCOPE` 指定**（在 `/etc/default/limit-ports` 配置，默认 `all` 保持旧行为）：
+    `all` 在 `prerouting(-150)` / `postrouting(150)` 统计所有匹配报文，不限网卡，包括本机、转发、回环及容器路径；
+    `local` 在 `input(-150)` / `output(-150)` 统计当前网络命名空间的本机收发，不包含直接转发；
+    `forward` 在 `forward(-150)` 统计实际路由转发，不包含本机收发。
+  - **NAT / 容器端口**：`all` 的入站端口在 DNAT 前、出站端口在 SNAT 后；`local` 入站及 `forward` 两个方向在 prerouting DNAT 后、postrouting SNAT 前，`local` 出站在 output DNAT 前。例：宿主 `20000` DNAT 到容器 `10001`，`all` 上行按 `20000`，`forward` 上行按 `10001`，`local` 不统计这条转发路径。host-network 容器及用户态代理属于本机收发；代理建立的是两条连接，端口重合时仍可能重复匹配。
+  - 更改范围后执行 `sudo portctl.sh acct-setup` 或菜单“建立 / 重建统计”。范围不一致时采样和用量策略报错，不会默默沿用旧规则。重建保留历史总量，跨范围采样后的文件标记为 `mixed`；要开始单一口径的新累计，重建后再显式执行 `acct-reset`。切换范围前应同时检查现有额度策略。
+  - `acct-show` 的 `#SCOPE` 行显示配置范围和已保存累计的历史范围；旧版无范围标记的数据按 `all` 解释。当前不支持按特定网卡统计，双端口同时命中时一个报文可计入不同端口的两个方向。
   - 用 nftables **命名计数器 + map** 实现，不依赖实时采样捕获短连接。
     计数由内核完成；重建或移除统计表时，最后一次快照到替换完成之间的流量仍可能未计入。
   - 只有**真的产生过流量**的端口才显示
@@ -422,7 +429,9 @@ sudo unshare -n env PORTCTL_TEST_NETNS=1 bash tests/integration.sh
 `limit_ports.sh` 的工作原理，以及几条容易被忽略的边界：
 
 - **分类器用 `flower`，同时覆盖 IPv4 和 IPv6**。旧版用 `u32` + `protocol ip`，**IPv6 包不匹配任何 filter，会落到默认队列，等于完全绕过了限速**（实测 IPv6 能跑满链路）。
-  `flower` 还支持端口区间，`@shared` 模式下整个区间只需要一条 filter。内核没有 `flower` 时自动回退到 `u32`（此时只有 IPv4 受控，日志里会明确提示）。
+  `flower` 还支持端口区间，`@shared` 模式下整个区间只需要一条 filter。默认 `IPV6_STRICT=yes`：检测到网卡有 IPv6 但只能使用 `u32` 时拒绝应用，避免误以为 IPv6 也受控；只有明确设置 `IPV6_STRICT=no` 才允许 IPv4-only 降级。
+
+- `IPV6_MODE=yes` 始终生成 IPv6 规则；`auto` 按网卡全局 IPv6 地址判断，地址出现或消失会使 `config-state` 变为 `pending`，需要重新应用。只读 `coverage` / `status` 检查内核过滤器是否覆盖全部计划队列；`filters-present` 表示已发现对应过滤器，并不代表已经做过实际吞吐测试。`IPV6_MODE=no` 是显式关闭，严格模式不会替用户重新打开。该检查不是后台地址监控；需要预防后来分配的 IPv6 时建议使用 `yes`。
 - **IPv4 和 IPv6 必须用不同的 filter `prio`**。同一个 parent 下两个协议族共用一个 prio，内核会返回
   `Filter with specified priority/protocol not found`。默认 `FILTER_PRIO=10`（IPv4）、`FILTER_PRIO6=11`（IPv6）。
 - **默认 class 只保证很小的带宽**（`DEFAULT_GUARANTEE`，默认 `1mbit`），`ceil` 才是链路容量（`DEFAULT_RATE`）。
@@ -432,7 +441,10 @@ sudo unshare -n env PORTCTL_TEST_NETNS=1 bash tests/integration.sh
 - **显式设置 `burst`/`cburst`**。不设置时 tc 用的是刚好卡在最小值的默认值，实测速率会略低于配置值；
   留空则按 `rate` 自动计算（一个调度 tick 的发送量），也可以用 `BURST`/`CBURST` 覆盖。
 - **整批命令用一次 `tc -batch` 下发**。旧版是每端口、每规则各调一次 `tc`（200 个端口约 600~1000 次进程调用），
-  现在是 1 次。失败时会**删除 root qdisc 回滚**，回到"不限速"而不是留下半套规则。
+  现在是 1 次。成功应用后，将批次与配置签名原子保存到 `/var/lib/portctl/limits/<NIC>.batch`。
+  下次替换前读取实时队列速率；失败时重建上一套端口规则，并恢复当时的策略速率。
+  速率批量更新部分失败也会反向恢复旧 rate/ceil。恢复失败会明确报错；首次应用或从旧版升级尚无快照时，只能清理半套规则并回到不限速。
+  这是失败后的尽力恢复，不是内核原子切换：切换期间有短暂空窗，重建会重置 tc 队列计数和排队状态，不影响独立的 nft 累计统计。快照仅用于本脚本拥有的 root qdisc，不会备份其他工具创建的队列。
 - **下发前先在临时 `dummy` 网卡上试跑同一批命令**（`PRECHECK`，默认 `auto`）。预检不通过就直接放弃，
   真实网卡**完全不会被碰**，现有队列保持原样。
 - **端口区间不要和内核临时端口范围重叠**。服务器自己的出站连接源端口取自
