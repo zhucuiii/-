@@ -369,9 +369,16 @@ sudo unshare -n env PORTCTL_TEST_NETNS=1 bash tests/integration.sh
 - `IPV6_MODE=yes` 始终生成 IPv6 规则；`auto` 按网卡全局 IPv6 地址判断，地址出现或消失会使 `config-state` 变为 `pending`，需要重新应用。只读 `coverage` / `status` 检查内核过滤器是否覆盖全部计划队列；`filters-present` 表示已发现对应过滤器，并不代表已经做过实际吞吐测试。`IPV6_MODE=no` 是显式关闭，严格模式不会替用户重新打开。该检查不是后台地址监控；需要预防后来分配的 IPv6 时建议使用 `yes`。
 - **IPv4 和 IPv6 必须用不同的 filter `prio`**。同一个 parent 下两个协议族共用一个 prio，内核会返回
   `Filter with specified priority/protocol not found`。默认 `FILTER_PRIO=10`（IPv4）、`FILTER_PRIO6=11`（IPv6）。
+- **队列是两层结构：根 class `1:1` 用链路速率，默认 class `1:2` 是它的子 class**，
+  限速端口 class 是 `1:2` 的兄弟节点（同样挂在 `1:1` 下）。未匹配端口走默认 class `1:2`。
 - **默认 class 只保证很小的带宽**（`DEFAULT_GUARANTEE`，默认 `1mbit`），`ceil` 才是链路容量（`DEFAULT_RATE`）。
   HTB 的 `rate` 是**保证**带宽而不是上限，所以旧写法把 `rate` 和 `ceil` 都设成链路容量是不准确的；
-  空闲时默认 class 仍然可以 burst 到 `DEFAULT_RATE`。
+  空闲时默认 class 仍然可以借用链路剩余带宽跑到 `DEFAULT_RATE`。
+- **这层嵌套是必须的**：HTB 只允许一个 class 借用**父 class 没用掉的**带宽超出自己的 `rate`，
+  所以直接挂在 qdisc 下面的默认 class 没有父 class 可借，`ceil` 形同虚设，会被 `rate` 卡死——
+  表现就是**所有没有限速规则的端口一起被限成 `DEFAULT_GUARANTEE`**（1mbit 时约 0.1 MB/s）。
+  作为 `1:1` 的子 class 时，它既能拿到自己那一份保证，空闲时也能跑到 `DEFAULT_RATE`，
+  同时不会抢走任何限速端口应得的速率（限速端口先被满足，剩下的才轮到默认 class）。
 - **每个限速 class 下面挂 `fq_codel`**。否则叶子队列是纯 FIFO，限速一开延迟就飙（bufferbloat）。
 - **显式设置 `burst`/`cburst`**。不设置时 tc 用的是刚好卡在最小值的默认值，实测速率会略低于配置值；
   留空则按 `rate` 自动计算（一个调度 tick 的发送量），也可以用 `BURST`/`CBURST` 覆盖。

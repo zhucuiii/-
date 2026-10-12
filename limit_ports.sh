@@ -17,11 +17,20 @@
 #     @shared       the whole rule shares a single HTB class
 #
 # Design notes:
-#   * The default class (1:1, unmatched traffic) gets a SMALL guaranteed
-#     rate (DEFAULT_GUARANTEE) and a LARGE ceiling (DEFAULT_RATE). HTB's
-#     "rate" is a guarantee, so giving the default class the full link rate
-#     would let it starve every limited port whenever unrelated traffic is
-#     pumping.
+#   * The tree is nested. Class 1:1 is the root class and carries the link
+#     rate (DEFAULT_RATE). The default class 1:2, which receives unmatched
+#     traffic, is its child and gets a SMALL guaranteed rate
+#     (DEFAULT_GUARANTEE) with DEFAULT_RATE as its ceiling; the shaped port
+#     classes are its siblings under 1:1.
+#
+#     The nesting is what makes sharing work. HTB lets a class exceed its
+#     "rate" up to "ceil" only with bandwidth its PARENT is not using, so a
+#     default class placed directly under the qdisc - where there is no
+#     parent class to borrow from - is capped at its "rate" no matter how
+#     large its "ceil" is. Flattened that way, DEFAULT_GUARANTEE throttles
+#     every unlisted port to a trickle. As a child of 1:1 it instead gets
+#     the guarantee it asks for and can still reach DEFAULT_RATE while the
+#     link is idle, without ever starving a limited port of its own rate.
 #   * Filters use the flower classifier when available: one filter covers a
 #     whole port range and both IPv4 and IPv6 are shaped. The u32 fallback
 #     only covers IPv4 and needs one filter per port.
@@ -69,7 +78,10 @@ SPEED="${SPEED:-12mbit}"
 # Link capacity. Used as the ceiling of the default class.
 DEFAULT_RATE="${DEFAULT_RATE:-1000mbit}"
 # HTB "rate" is a guarantee, so unmatched traffic only guarantees this much
-# and still bursts up to DEFAULT_RATE when the link is otherwise idle.
+# and still reaches DEFAULT_RATE while the link is otherwise idle. It is the
+# guarantee of the DEFAULT CLASS, which is a child of the root class: put
+# directly under the qdisc it would be capped at this rate instead (see the
+# design notes at the top of this file).
 DEFAULT_GUARANTEE="${DEFAULT_GUARANTEE:-1mbit}"
 PORT_START="${PORT_START:-10001}"
 PORT_END="${PORT_END:-10200}"
@@ -598,6 +610,10 @@ build_plan() {
 
 base_signature() {
     {
+        # The tree layout is part of the signature: an upgraded script that
+        # builds a different tree must report "pending" so the rules get
+        # re-applied, instead of leaving the old queues in place.
+        printf 'tree-nested-v1\n'
         printf '%s\n' "$NIC" "$CLASS_START" "$R2Q" "$DEFAULT_RATE" "$DEFAULT_GUARANTEE" \
             "$FILTER_KIND" "$IPV6_MODE" "$IPV6_STRICT" "$FILTER_PRIO" "$FILTER_PRIO6" "$FQ_CODEL" "$FQ_CODEL_OPTS" "$BURST" "$CBURST"
         cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf 'unknown\n'
@@ -805,7 +821,10 @@ validate_config() {
         auto|yes|no) ;;
         *) die "PRECHECK 只能是 auto / yes / no。" ;;
     esac
-    (( CLASS_START >= 1 && CLASS_START <= 65535 )) || die "CLASS_START 超出 class 范围。"
+    # 1:1 is the root class and 1:2 the default class; a port rule must not
+    # be given either id.
+    (( CLASS_START >= 3 && CLASS_START <= 65535 )) ||
+        die "CLASS_START 必须 >= 3（1:1 根 class 和 1:2 默认 class 已保留）。"
     (( R2Q >= 1 )) || die "R2Q 必须大于 0。"
     is_rate "${DEFAULT_RATE,,}" || die "DEFAULT_RATE 速率格式无效: $DEFAULT_RATE"
     is_rate "${DEFAULT_GUARANTEE,,}" || die "DEFAULT_GUARANTEE 速率格式无效: $DEFAULT_GUARANTEE"
@@ -926,17 +945,24 @@ build_batch() {
     local out="$1" i
     : >"$out"
 
-    printf 'qdisc add dev %s root handle 1: htb default 1 r2q %s\n' \
+    # The shaped classes and the default class both live under the root class
+    # 1:1. The root class owns the link rate; the default class keeps a small
+    # guarantee but borrows spare bandwidth from 1:1 up to DEFAULT_RATE.
+    printf 'qdisc add dev %s root handle 1: htb default 2 r2q %s\n' \
         "$NIC" "$R2Q" >>"$out"
-
-    # Guarantee only a little to unmatched traffic, but let it use the whole
-    # link when nothing else needs bandwidth.
     printf 'class add dev %s parent 1: classid 1:1 htb rate %s ceil %s burst %s cburst %s\n' \
+        "$NIC" "$DEFAULT_RATE" "$DEFAULT_RATE" \
+        "$(compute_burst "$DEFAULT_RATE")" "$(compute_cburst "$DEFAULT_RATE")" >>"$out"
+    printf 'class add dev %s parent 1:1 classid 1:2 htb rate %s ceil %s burst %s cburst %s\n' \
         "$NIC" "$DEFAULT_GUARANTEE" "$DEFAULT_RATE" \
         "$(compute_burst "$DEFAULT_RATE")" "$(compute_cburst "$DEFAULT_RATE")" >>"$out"
+    if fq_codel_enabled; then
+        printf 'qdisc add dev %s parent 1:2 handle 2: fq_codel%s\n' \
+            "$NIC" "$FQ_CODEL_OPTS" >>"$out"
+    fi
 
     for ((i = 0; i < ${#PLAN_ID[@]}; i++)); do
-        printf 'class add dev %s parent 1: classid 1:%s htb rate %s ceil %s burst %s cburst %s\n' \
+        printf 'class add dev %s parent 1:1 classid 1:%s htb rate %s ceil %s burst %s cburst %s\n' \
             "$NIC" "${PLAN_ID[i]}" "${PLAN_RATE[i]}" "${PLAN_RATE[i]}" \
             "$(compute_burst "${PLAN_RATE[i]}")" "$(compute_cburst "${PLAN_RATE[i]}")" >>"$out"
 
@@ -1210,7 +1236,7 @@ plan_rules() {
     build_plan
 
     log "limit_ports.sh $LIMIT_PORTS_VERSION"
-    log "网卡: $NIC   默认速率: $SPEED   默认 class: rate $DEFAULT_GUARANTEE / ceil $DEFAULT_RATE"
+    log "网卡: $NIC   默认速率: $SPEED   根 class 1:1: rate $DEFAULT_RATE   默认 class 1:2: rate $DEFAULT_GUARANTEE / ceil $DEFAULT_RATE"
     log "规则来源: $SPEC_SOURCE（$(rules_summary)）"
     log "分类器: $(filter_kind_label)   IPv6: $(ipv6_label)   fq_codel: $FQ_CODEL"
     warn_local_port_conflict

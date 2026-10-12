@@ -128,7 +128,7 @@ pass "explicit flower selection fails when cls_flower is unavailable"
     tc() {
         case "$*" in
             'qdisc del '*) return 0 ;;
-            'class show '*) printf 'class htb 1:1 root rate 1Mbit ceil 1000Mbit\nclass htb 1:10 parent 1: rate 5Mbit ceil 5Mbit\n' ;;
+            'class show '*) printf 'class htb 1:1 root rate 1000Mbit ceil 1000Mbit\nclass htb 1:2 parent 1:1 rate 1Mbit ceil 1000Mbit\nclass htb 1:10 parent 1:1 rate 5Mbit ceil 5Mbit\n' ;;
             '-batch '*)
                 cp "$2" "$TMP/last-apply.batch"
                 if [[ "${FAIL_APPLY:-0}" == 1 ]]; then FAIL_APPLY=0; return 1; fi
@@ -198,6 +198,73 @@ pass "auto IPv6 address changes mark the previous rules pending"
     if grep -q 'protocol ipv6' "$TMP/no-v6.batch"; then fail "auto mode without IPv6 generated IPv6 filters"; fi
 )
 pass "IPv6 coverage inspects installed TCP/UDP filters and auto skips absent addresses"
+
+# Unmatched traffic must be able to borrow the whole link. HTB only lets a
+# class exceed its "rate" using bandwidth its parent is not using, so the
+# default class has to sit under the root class 1:1 rather than beside it
+# under the qdisc: a default class directly under the qdisc is capped at its
+# "rate" and throttles every port without a rule.
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
+    NIC=eth0 DEFAULT_RATE=1000mbit DEFAULT_GUARANTEE=1mbit \
+        SPEC_STRING='10001-10002=12mbit' FILTER_KIND=flower IPV6_MODE=no
+    parse_spec "$SPEC_STRING"; build_plan
+    build_batch "$TMP/tree.batch"
+
+    grep -q '^qdisc add dev eth0 root handle 1: htb default 2 r2q ' "$TMP/tree.batch" ||
+        fail "default traffic is not routed to the default class 1:2"
+    grep -q '^class add dev eth0 parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit' "$TMP/tree.batch" ||
+        fail "root class 1:1 does not carry the link rate"
+    grep -q '^class add dev eth0 parent 1:1 classid 1:2 htb rate 1mbit ceil 1000mbit' "$TMP/tree.batch" ||
+        fail "default class 1:2 is not nested under the root class with a small guarantee"
+    grep -q '^class add dev eth0 parent 1:1 classid 1:10 htb rate 12mbit' "$TMP/tree.batch" ||
+        fail "limited ports are not siblings of the default class under 1:1"
+    if grep -q '^class add dev eth0 parent 1: classid 1:2 ' "$TMP/tree.batch"; then
+        fail "default class sits directly under the qdisc and will be capped at its guarantee"
+    fi
+    if grep -q 'classid 1:1 htb rate 1mbit' "$TMP/tree.batch"; then
+        fail "root class still carries the small guarantee"
+    fi
+)
+pass "default class is nested under a link-rate root class so unmatched traffic can borrow bandwidth"
+
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
+    NIC=eth0 SPEC_STRING='8080=5mbit' FILTER_KIND=flower IPV6_MODE=no
+    CLASS_START=1
+    if (validate_config 0) >"$TMP/out" 2>&1; then
+        fail "a port rule was allowed to claim the reserved default class id"
+    fi
+    grep -q 'CLASS_START' "$TMP/out" || fail "reserved class id conflict did not mention CLASS_START"
+)
+pass "port rules cannot claim the class ids reserved for the root and default classes"
+
+# The tree layout is part of the applied signature, so upgrading the script
+# cannot leave the old flat queues in place while reporting "applied".
+(
+    source <(sed '$d' "$ROOT/limit_ports.sh")
+    LIMIT_STATE_DIR="$TMP/tree-state"
+    NIC=eth0 SPEC_STRING='8080=5mbit' FILTER_KIND=flower IPV6_MODE=no
+    parse_spec "$SPEC_STRING"; build_plan
+    mkdir -p "$LIMIT_STATE_DIR"
+    build_batch "$TMP/tree.batch"
+    { printf '# signature %s\n' "$(base_signature)"; cat "$TMP/tree.batch"; } \
+        >"$(applied_batch_file)"
+    [[ "$(config_state)" == applied ]] || fail "current tree layout is not reported as applied"
+
+    # Restore the signature the previous flat layout produced: same settings,
+    # no layout marker. An upgraded server still has exactly that on disk.
+    old_sig="$( { printf '%s\n' "$NIC" "$CLASS_START" "$R2Q" "$DEFAULT_RATE" "$DEFAULT_GUARANTEE" \
+            "$FILTER_KIND" "$IPV6_MODE" "$IPV6_STRICT" "$FILTER_PRIO" "$FILTER_PRIO6" "$FQ_CODEL" "$FQ_CODEL_OPTS" "$BURST" "$CBURST"
+        cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf 'unknown\n'
+        printf 'ipv6-not-required\n'
+        printf '8080\t8080\t5mbit\tper-port\n'; } | cksum)"
+    sed -i "1s|.*|# signature ${old_sig}|" "$(applied_batch_file)"
+    if [[ "$(config_state)" == applied ]]; then
+        fail "queues built by the previous flat layout were still reported as applied"
+    fi
+)
+pass "an upgraded script reports the previous flat tree as pending"
 
 (
     source <(sed '$d' "$ROOT/limit_ports.sh")
