@@ -78,38 +78,42 @@ check_route $'1\n1\n0\n0' add
 pass "limit menu routes to unified add"
 check_route $'01\n2\n1\n2\n0\n3\n4\n0\n0' $'edit-one\nedit-all\ndelete\nlimit:apply'
 pass "single and bulk rate edits, delete and apply retain their routes"
-check_route $'1\n5\n1\n2\n3\n0\n0\n0' $'realtime\naccounting\nall-traffic'
-pass "traffic is reachable from the limit menu"
-check_route $'02\n1\n2\n3\n0\n0' $'realtime\naccounting\nall-traffic'
-pass "traffic is reachable directly from the main menu"
-check_route $'1\n6\n1\n2\n3\n0\n0\n0' $'root:tc -s qdisc show dev eth0\nroot:tc -s class show dev eth0\nlimit-local:plan -v\nclear'
+check_route $'1\n5\n1\n2\n3\n0\n0\n0' $'root:tc -s qdisc show dev eth0\nroot:tc -s class show dev eth0\nlimit-local:plan -v\nclear'
 pass "tc inspection, execution plan and clear live in advanced tools"
-check_route $'03\n1\n1\n1\n2\n2\n3\n0\n0' $'fw-port\nfw-ip\nfw-delete\nfw-apply'
+check_route $'02\n1\n1\n1\n2\n2\n3\n0\n0' $'fw-port\nfw-ip\nfw-delete\nfw-apply'
 pass "firewall port and IP add flows retain their routes"
-check_route $'3\n4\n1\n2\n3\n0\n0\n0' $'fw-system\nfw-settings\nfw-clear'
+check_route $'2\n4\n1\n2\n3\n0\n0\n0' $'fw-system\nfw-settings\nfw-clear'
 pass "firewall settings, actual rules and clear remain reachable"
-check_route $'04\n1\n2\n3\n4\n5\n6\n0\n0' \
+check_route $'03\n1\n2\n3\n4\n5\n6\n0\n0' \
     $'root:systemctl start limit-ports.service\nroot:systemctl restart limit-ports.service\nroot:systemctl stop limit-ports.service\nroot:systemctl enable limit-ports.service\nroot:systemctl disable limit-ports.service\nroot:systemctl --no-pager --full status limit-ports.service'
 pass "service start, stop and autostart are independent operations"
-check_route $'05\n1\n1\n2\n0\n2\n3\n4\n5\n0\n0' \
+check_route $'04\n1\n1\n2\n0\n2\n3\n4\n5\n0\n0' \
     $'log:限速服务日志（limit-ports.service）\nlog:防火墙服务日志（portctl-firewall.service）\nlog:系统错误日志\nlogin\nfollow\nexport'
 pass "common logs and diagnostic export remain reachable"
-check_route $'5\n6\n1\n2\n3\n0\n0\n0' $'log:内核日志\nlog:全部系统日志\nvacuum'
+check_route $'4\n6\n1\n2\n3\n0\n0\n0' $'log:内核日志\nlog:全部系统日志\nvacuum'
 pass "kernel logs and cleanup move to advanced tools"
-check_route $'06\n1\n2\n3\n0\n0' $'info\nupdate\nuninstall'
+check_route $'05\n1\n2\n3\n0\n0' $'info\nupdate\nuninstall'
 pass "maintenance contains system info, update and uninstall"
-check_route $'07\n0\n0' policy
+check_route $'06\n0\n0' policy
 pass "usage and schedule policies have a top-level entry"
-check_route $'00\n1\n0\n2\n0\n3\n0\n4\n0\n5\n0\n6\n0\n0' ""
+check_route $'1\n6\n0\n0' policy
+pass "usage and schedule policies remain reachable from the limit menu"
+check_route $'00\n1\n0\n2\n0\n3\n0\n4\n0\n5\n0\n0' ""
 pass "refresh and all top-level returns have no side effects"
+if grep -q '流量查看' "$TMP/menu.out"; then
+    fail "traffic viewing leaked back into the main or limit menu"
+fi
+pass "traffic viewing is absent from the main and limit menus"
 if head -n 25 "$TMP/menu.out" | grep -q '卸载程序'; then
     fail "uninstall leaked back into the main menu"
 fi
 pass "uninstall is not a main-menu shortcut"
 check_route $'1\n9\n0\n0' ""
 pass "invalid input does not dispatch an unrelated action"
+check_route $'07\n1\n7\n0\n0' ""
+pass "removed top-level and limit menu numbers do not dispatch actions"
 
-for menu in main_menu show_limit_menu show_traffic_menu show_rule_edit_menu \
+for menu in main_menu show_limit_menu show_rule_edit_menu \
     show_limit_advanced_menu show_firewall_menu show_firewall_advanced_menu \
     fw_add_menu fw_settings_menu show_service_menu show_logs_menu \
     show_service_logs_menu show_logs_advanced_menu show_maintenance_menu; do

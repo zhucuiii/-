@@ -190,12 +190,11 @@ show_config_state() {
 draw_menu() {
     printf '\n%s----------------------------------------%s\n' "$BLUE" "$RESET"
     printf '%s01.%s  %s端口限速%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s02.%s  %s流量查看%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s03.%s  %s防火墙规则%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s04.%s  %s限速服务%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s05.%s  %s日志中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s06.%s  %s系统与维护%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
-    printf '%s07.%s  %s用量与时段策略%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s02.%s  %s防火墙规则%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s03.%s  %s限速服务%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s04.%s  %s日志中心%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s05.%s  %s系统与维护%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
+    printf '%s06.%s  %s用量与时段策略%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s----------------------------------------%s\n' "$BLUE" "$RESET"
     printf '%s00.%s  %s刷新状态%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
     printf '%s0.%s   %s退出控制台%s\n' "$CYAN" "$RESET" "$GREEN" "$RESET"
@@ -1681,28 +1680,6 @@ show_traffic_accounting() {
     done
 }
 
-show_traffic_menu() {
-    local choice
-    while true; do
-        clear_screen
-        draw_brand
-        printf '\n%s[02] 流量查看%s\n\n' "$YELLOW" "$RESET"
-        printf '%s1.%s 限速端口实时流量\n' "$GREEN" "$RESET"
-        printf '%s2.%s 上行 / 下行累计\n' "$GREEN" "$RESET"
-        printf '%s3.%s 全部端口监控（排障）\n' "$GREEN" "$RESET"
-        printf '%s0.%s 返回\n' "$GREEN" "$RESET"
-        printf '\n%s选择:%s ' "$CYAN" "$RESET"
-        read -r choice || return 0
-        case "$choice" in
-            1) show_port_stats ;;
-            2) show_traffic_accounting ;;
-            3) show_all_port_traffic ;;
-            0|"") return ;;
-            *) printf '%s请输入 1-3 或 0。%s\n' "$RED" "$RESET"; pause_screen ;;
-        esac
-    done
-}
-
 show_limit_advanced_menu() {
     local choice
     while true; do
@@ -1751,9 +1728,8 @@ show_limit_menu() {
         printf '%s2.%s 修改规则速率\n' "$GREEN" "$RESET"
         printf '%s3.%s 删除限速规则\n' "$GREEN" "$RESET"
         printf '%s4.%s 应用当前配置\n' "$GREEN" "$RESET"
-        printf '%s5.%s 流量查看\n' "$GREEN" "$RESET"
-        printf '%s6.%s 高级与排障\n' "$GREEN" "$RESET"
-        printf '%s7.%s 用量与时段策略\n' "$GREEN" "$RESET"
+        printf '%s5.%s 高级与排障\n' "$GREEN" "$RESET"
+        printf '%s6.%s 用量与时段策略\n' "$GREEN" "$RESET"
         printf '%s0.%s 返回主菜单\n' "$GREEN" "$RESET"
         printf '\n%s选择:%s ' "$CYAN" "$RESET"
         read -r choice || return 0
@@ -1766,12 +1742,11 @@ show_limit_menu() {
                 limit_root apply || true
                 pause_screen
                 ;;
-            5) show_traffic_menu ;;
-            6) show_limit_advanced_menu ;;
-            7) show_policy_menu ;;
+            5) show_limit_advanced_menu ;;
+            6) show_policy_menu ;;
             0|"") return ;;
             *)
-                printf '%s请输入 1-7 或 0。%s\n' "$RED" "$RESET"
+                printf '%s请输入 1-6 或 0。%s\n' "$RED" "$RESET"
                 pause_screen
                 ;;
         esac
@@ -3154,7 +3129,7 @@ show_firewall_menu() {
         fw_load || { pause_screen; return; }
         clear_screen
         draw_brand
-        printf '\n%s[03] 防火墙规则%s\n' "$YELLOW" "$RESET"
+        printf '\n%s[02] 防火墙规则%s\n' "$YELLOW" "$RESET"
         printf '%s后端:%s %s    %s开机自启:%s %s\n' \
             "$DIM" "$RESET" "$(fw_backend_label "$(fw_backend)")" \
             "$DIM" "$RESET" "$(fw_autostart_label)"
@@ -3210,7 +3185,7 @@ show_service_menu() {
     while true; do
         clear_screen
         draw_brand
-        printf '\n%s[04] 限速服务%s\n\n' "$YELLOW" "$RESET"
+        printf '\n%s[03] 限速服务%s\n\n' "$YELLOW" "$RESET"
         if ! command -v systemctl >/dev/null 2>&1; then
             printf '%s当前系统没有 systemctl，无法管理限速服务。%s\n' "$YELLOW" "$RESET"
             pause_screen
@@ -3617,7 +3592,7 @@ show_logs_menu() {
         backend="$(log_backend)"
         clear_screen
         draw_brand
-        printf '\n%s[05] 日志中心%s\n' "$YELLOW" "$RESET"
+        printf '\n%s[04] 日志中心%s\n' "$YELLOW" "$RESET"
         case "$backend" in
             journald)
                 printf '%s来源:%s journald    %s持久化:%s %s    %s占用:%s %s\n' \
@@ -3751,7 +3726,7 @@ show_maintenance_menu() {
     while true; do
         clear_screen
         draw_brand
-        printf '\n%s[06] 系统与维护%s\n\n' "$YELLOW" "$RESET"
+        printf '\n%s[05] 系统与维护%s\n\n' "$YELLOW" "$RESET"
         printf '%s1.%s 系统信息\n' "$GREEN" "$RESET"
         printf '%s2.%s 从 GitHub 更新脚本\n' "$GREEN" "$RESET"
         printf '%s3.%s 卸载程序\n' "$RED" "$RESET"
@@ -3779,12 +3754,11 @@ main_menu() {
         read -r choice || return 0
         case "$choice" in
             1|01) show_limit_menu ;;
-            2|02) show_traffic_menu ;;
-            3|03) show_firewall_menu ;;
-            4|04) show_service_menu ;;
-            5|05) show_logs_menu ;;
-            6|06) show_maintenance_menu ;;
-            7|07) show_policy_menu ;;
+            2|02) show_firewall_menu ;;
+            3|03) show_service_menu ;;
+            4|04) show_logs_menu ;;
+            5|05) show_maintenance_menu ;;
+            6|06) show_policy_menu ;;
             00) continue ;;
             0|q|Q)
                 clear_screen
